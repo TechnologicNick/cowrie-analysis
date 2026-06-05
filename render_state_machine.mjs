@@ -21,7 +21,8 @@ const EDGE_SENSOR_COLORS = {
 };
 
 function escapeXml(text) {
-  return String(text)
+  const cleaned = String(text).replaceAll(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+  return cleaned
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -102,6 +103,134 @@ function polylinePath(section) {
   return `M ${first.x} ${first.y} ` + rest.map((point) => `L ${point.x} ${point.y}`).join(" ");
 }
 
+function computeBounds(points) {
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (const point of points) {
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x);
+    maxY = Math.max(maxY, point.y);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function computeSegmentBounds(startPoint, endPoint) {
+  return {
+    minX: Math.min(startPoint.x, endPoint.x),
+    minY: Math.min(startPoint.y, endPoint.y),
+    maxX: Math.max(startPoint.x, endPoint.x),
+    maxY: Math.max(startPoint.y, endPoint.y),
+  };
+}
+
+function buildSceneData(graphData, laidOut, nodeMeta, edgeMeta, width, height, title) {
+  const sceneNodes = [];
+  for (const node of laidOut.children ?? []) {
+    const meta = nodeMeta.get(node.id);
+    if (!meta) continue;
+    const colorKey = meta.color_key;
+    const fill = NODE_COLORS[colorKey] ?? NODE_COLORS.other;
+    const stroke = rgba(fill, 0.95);
+    const textColor = meta.node_type === "terminal" || colorKey === "root" ? "#f8f6f1" : "#111111";
+    const widthNode = node.width ?? 100;
+    const heightNode = node.height ?? 30;
+    sceneNodes.push({
+      id: node.id,
+      x: node.x ?? 0,
+      y: node.y ?? 0,
+      width: widthNode,
+      height: heightNode,
+      radius: meta.node_type === "command" ? 8 : 6,
+      fill,
+      stroke,
+      strokeWidth: nodeStrokeWidth(meta.total_count),
+      text: meta.display_label,
+      textColor,
+      fontSize: 12,
+      totalCount: meta.total_count,
+      bounds: {
+        minX: node.x ?? 0,
+        minY: node.y ?? 0,
+        maxX: (node.x ?? 0) + widthNode,
+        maxY: (node.y ?? 0) + heightNode,
+      },
+    });
+  }
+
+  const sceneEdges = [];
+  for (const edge of laidOut.edges ?? []) {
+    const meta = edgeMeta.get(edge.id);
+    if (!meta) continue;
+    const color = EDGE_SENSOR_COLORS[meta.sensor_mix] ?? EDGE_SENSOR_COLORS.both;
+    for (const section of edge.sections ?? []) {
+      const points = [section.startPoint, ...(section.bendPoints ?? []), section.endPoint];
+      for (let index = 0; index < points.length - 1; index += 1) {
+        const startPoint = points[index];
+        const endPoint = points[index + 1];
+        sceneEdges.push({
+          id: `${edge.id}:${index}`,
+          x1: startPoint.x,
+          y1: startPoint.y,
+          x2: endPoint.x,
+          y2: endPoint.y,
+          stroke: rgba(color, 0.42),
+          strokeWidth: edgeStrokeWidth(meta.total_count),
+          bounds: computeSegmentBounds(startPoint, endPoint),
+        });
+      }
+    }
+  }
+
+  const stepLabels = [];
+  const seenSteps = new Set();
+  for (const node of laidOut.children ?? []) {
+    const meta = nodeMeta.get(node.id);
+    if (!meta || seenSteps.has(meta.step_index)) continue;
+    seenSteps.add(meta.step_index);
+    stepLabels.push({
+      stepIndex: meta.step_index,
+      x: (node.x ?? 0) + 4,
+      y: 20,
+      text: `step ${meta.step_index}`,
+    });
+  }
+  if (!seenSteps.has(0)) {
+    stepLabels.push({ stepIndex: 0, x: 4, y: 20, text: "step 0" });
+  }
+
+  const legend = [
+    ["root", "root"],
+    ["event", "event"],
+    ["terminal", "end"],
+    ["fingerprinting/recon", "cmd recon"],
+    ["credential_persistence", "cmd creds"],
+    ["download_exec", "cmd download"],
+    ["proxy_tunnel", "cmd tunnel"],
+    ["cleanup/evasion", "cmd cleanup"],
+    ["other", "cmd other"],
+  ].map(([key, label], idx) => ({
+    key,
+    label,
+    fill: NODE_COLORS[key],
+    x: 40 + (idx % 3) * 200,
+    y: height - 110 + Math.floor(idx / 3) * 26,
+  }));
+
+  return {
+    meta: graphData.meta,
+    title,
+    width,
+    height,
+    nodes: sceneNodes,
+    edges: sceneEdges,
+    stepLabels,
+    legend,
+  };
+}
+
 async function main() {
   const [, , inputArg, outputArg] = process.argv;
   if (!inputArg || !outputArg) {
@@ -112,6 +241,7 @@ async function main() {
   const inputPath = path.resolve(inputArg);
   const outputPath = path.resolve(outputArg);
   const htmlOutputPath = outputPath.replace(/\.svg$/i, ".html");
+  const sceneOutputPath = outputPath.replace(/\.svg$/i, ".scene.json");
   const raw = await fs.readFile(inputPath, "utf-8");
   const graphData = JSON.parse(raw);
 
@@ -134,11 +264,16 @@ async function main() {
     const strokeWidth = edgeStrokeWidth(meta.total_count);
     const sections = edge.sections ?? [];
     for (const section of sections) {
-      edgeSvg.push(
-        `<path d="${polylinePath(section)}" fill="none" stroke="${rgba(color, 0.42)}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round">` +
-          `<title>${escapeXml(`${meta.source_label} -> ${meta.target_label}\nbaseline=${meta.baseline_count}\nhostname=${meta.hostname_count}\ntotal=${meta.total_count}`)}</title>` +
-        `</path>`
-      );
+      const points = [section.startPoint, ...(section.bendPoints ?? []), section.endPoint];
+      for (let index = 0; index < points.length - 1; index += 1) {
+        const startPoint = points[index];
+        const endPoint = points[index + 1];
+        edgeSvg.push(
+          `<line x1="${startPoint.x}" y1="${startPoint.y}" x2="${endPoint.x}" y2="${endPoint.y}" stroke="${rgba(color, 0.42)}" stroke-width="${strokeWidth}" stroke-linecap="round">` +
+            `<title>${escapeXml(`${meta.source_label} -> ${meta.target_label}\nbaseline=${meta.baseline_count}\nhostname=${meta.hostname_count}\ntotal=${meta.total_count}`)}</title>` +
+          `</line>`
+        );
+      }
     }
   }
 
@@ -202,6 +337,7 @@ async function main() {
   }).join("");
 
   const title = `Cowrie Session State Machine (${graphData.meta.session_count} sessions)`;
+  const sceneData = buildSceneData(graphData, laidOut, nodeMeta, edgeMeta, width, height, title);
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
   <rect x="0" y="0" width="${width}" height="${height}" fill="#f7f3ea" />
@@ -220,6 +356,7 @@ async function main() {
 </svg>`;
 
   await fs.writeFile(outputPath, svg, "utf-8");
+  await fs.writeFile(sceneOutputPath, JSON.stringify(sceneData), "utf-8");
 
   const html = `<!doctype html>
 <html lang="en">
@@ -285,17 +422,21 @@ async function main() {
         linear-gradient(180deg, #fbf8f0 0%, #f3ecdf 100%);
     }
     .viewport.dragging { cursor: grabbing; }
-    .canvas {
-      transform-origin: 0 0;
-      will-change: transform;
-      display: inline-block;
-      padding: 20px;
-    }
-    .canvas svg {
+    .stage {
+      width: 100%;
+      height: 100%;
       display: block;
-      box-shadow: 0 24px 60px rgba(0,0,0,0.10);
-      border-radius: 12px;
-      background: var(--bg);
+    }
+    .status {
+      position: absolute;
+      left: 16px;
+      bottom: 16px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: rgba(255, 250, 240, 0.92);
+      color: var(--muted);
+      font-size: 12px;
     }
   </style>
 </head>
@@ -308,25 +449,161 @@ async function main() {
     <div class="meta">wheel: zoom, drag: pan, range: ${escapeXml((graphData.meta.from_date ?? "start") + ".." + (graphData.meta.to_date ?? "end"))}</div>
   </div>
   <div class="viewport" id="viewport">
-    <div class="canvas" id="canvas">
-${svg}
-    </div>
+    <canvas class="stage" id="stage"></canvas>
+    <div class="status" id="status">loading scene...</div>
   </div>
   <script>
     const viewport = document.getElementById('viewport');
-    const canvas = document.getElementById('canvas');
+    const stage = document.getElementById('stage');
+    const ctx = stage.getContext('2d');
+    const status = document.getElementById('status');
     const zoomIn = document.getElementById('zoomIn');
     const zoomOut = document.getElementById('zoomOut');
     const resetView = document.getElementById('resetView');
+    const sceneUrl = '/cowrie_state_machine.scene.json';
+    let scene = null;
     let scale = 1;
-    let panX = 0;
-    let panY = 0;
+    let panX = 20;
+    let panY = 20;
     let dragging = false;
     let lastX = 0;
     let lastY = 0;
+    let deviceScale = Math.max(1, window.devicePixelRatio || 1);
+    let drawQueued = false;
 
-    function applyTransform() {
-      canvas.style.transform = 'translate(' + panX + 'px, ' + panY + 'px) scale(' + scale + ')';
+    function intersects(a, b) {
+      return !(a.maxX < b.minX || a.minX > b.maxX || a.maxY < b.minY || a.minY > b.maxY);
+    }
+
+    function resizeCanvas() {
+      deviceScale = Math.max(1, window.devicePixelRatio || 1);
+      const widthCss = viewport.clientWidth;
+      const heightCss = viewport.clientHeight;
+      stage.width = Math.floor(widthCss * deviceScale);
+      stage.height = Math.floor(heightCss * deviceScale);
+      stage.style.width = widthCss + 'px';
+      stage.style.height = heightCss + 'px';
+      queueDraw();
+    }
+
+    function updateStatus() {
+      const nodeCount = scene ? scene.nodes.length : 0;
+      const edgeCount = scene ? scene.edges.length : 0;
+      status.textContent = 'zoom ' + scale.toFixed(2) + 'x | pan ' + Math.round(panX) + ', ' + Math.round(panY) + ' | nodes ' + nodeCount + ' | edges ' + edgeCount;
+    }
+
+    function drawBackground(widthCss, heightCss) {
+      ctx.fillStyle = '#f3ecdf';
+      ctx.fillRect(0, 0, widthCss, heightCss);
+      const gradient = ctx.createRadialGradient(0, 0, 0, 0, 0, Math.max(widthCss, heightCss) * 0.35);
+      gradient.addColorStop(0, 'rgba(31,78,121,0.10)');
+      gradient.addColorStop(1, 'rgba(31,78,121,0)');
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, widthCss, heightCss);
+    }
+
+    function draw() {
+      drawQueued = false;
+      const widthCss = stage.width / deviceScale;
+      const heightCss = stage.height / deviceScale;
+      ctx.setTransform(deviceScale, 0, 0, deviceScale, 0, 0);
+      drawBackground(widthCss, heightCss);
+      if (!scene) {
+        updateStatus();
+        return;
+      }
+      const viewMinX = (-panX) / scale;
+      const viewMinY = (-panY) / scale;
+      const viewMaxX = (widthCss - panX) / scale;
+      const viewMaxY = (heightCss - panY) / scale;
+      const viewBounds = {
+        minX: Math.max(0, viewMinX),
+        minY: Math.max(0, viewMinY),
+        maxX: Math.min(scene.width, viewMaxX),
+        maxY: Math.min(scene.height, viewMaxY),
+      };
+
+      if (viewBounds.minX < viewBounds.maxX && viewBounds.minY < viewBounds.maxY) {
+        ctx.save();
+        ctx.translate(panX, panY);
+        ctx.scale(scale, scale);
+
+        ctx.shadowColor = 'rgba(0,0,0,0.12)';
+        ctx.shadowBlur = 22;
+        ctx.shadowOffsetY = 10;
+        ctx.fillStyle = '#f7f3ea';
+        ctx.fillRect(viewBounds.minX, viewBounds.minY, viewBounds.maxX - viewBounds.minX, viewBounds.maxY - viewBounds.minY);
+        ctx.shadowColor = 'transparent';
+
+        for (const edge of scene.edges) {
+          if (!intersects(edge.bounds, viewBounds)) continue;
+          ctx.beginPath();
+          ctx.moveTo(edge.x1, edge.y1);
+          ctx.lineTo(edge.x2, edge.y2);
+          ctx.strokeStyle = edge.stroke;
+          ctx.lineWidth = edge.strokeWidth;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.stroke();
+        }
+
+        for (const node of scene.nodes) {
+          if (!intersects(node.bounds, viewBounds)) continue;
+          const x = node.x;
+          const y = node.y;
+          const w = node.width;
+          const h = node.height;
+          const r = node.radius;
+          ctx.beginPath();
+          ctx.moveTo(x + r, y);
+          ctx.lineTo(x + w - r, y);
+          ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+          ctx.lineTo(x + w, y + h - r);
+          ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+          ctx.lineTo(x + r, y + h);
+          ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+          ctx.lineTo(x, y + r);
+          ctx.quadraticCurveTo(x, y, x + r, y);
+          ctx.closePath();
+          ctx.fillStyle = node.fill;
+          ctx.globalAlpha = 0.92;
+          ctx.fill();
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = node.stroke;
+          ctx.lineWidth = node.strokeWidth;
+          ctx.stroke();
+          ctx.fillStyle = node.textColor;
+          ctx.font = node.fontSize + 'px Segoe UI, Arial, sans-serif';
+          ctx.fillText(node.text, x + 12, y + Math.round(h / 2) + 4);
+        }
+
+        ctx.fillStyle = '#444';
+        ctx.font = '12px Segoe UI, Arial, sans-serif';
+        for (const label of scene.stepLabels) {
+          if (label.x < viewBounds.minX - 100 || label.x > viewBounds.maxX + 100) continue;
+          ctx.fillText(label.text, label.x, label.y);
+        }
+
+        ctx.fillStyle = '#222';
+        ctx.font = '12px Segoe UI, Arial, sans-serif';
+        for (const item of scene.legend) {
+          const legendBounds = { minX: item.x, minY: item.y - 12, maxX: item.x + 160, maxY: item.y + 8 };
+          if (!intersects(legendBounds, viewBounds)) continue;
+          ctx.fillStyle = item.fill;
+          ctx.fillRect(item.x, item.y - 12, 18, 18);
+          ctx.fillStyle = '#222';
+          ctx.fillText(item.label, item.x + 26, item.y + 2);
+        }
+
+        ctx.restore();
+      }
+      updateStatus();
+    }
+
+    function queueDraw() {
+      if (drawQueued) return;
+      drawQueued = true;
+      window.requestAnimationFrame(draw);
     }
 
     function zoomAt(factor, clientX, clientY) {
@@ -339,7 +616,7 @@ ${svg}
       panX = px - worldX * nextScale;
       panY = py - worldY * nextScale;
       scale = nextScale;
-      applyTransform();
+      queueDraw();
     }
 
     viewport.addEventListener('wheel', (event) => {
@@ -360,7 +637,7 @@ ${svg}
       panY += event.clientY - lastY;
       lastX = event.clientX;
       lastY = event.clientY;
-      applyTransform();
+      queueDraw();
     });
 
     window.addEventListener('mouseup', () => {
@@ -372,12 +649,29 @@ ${svg}
     zoomOut.addEventListener('click', () => zoomAt(1 / 1.2, viewport.clientWidth / 2, viewport.clientHeight / 2));
     resetView.addEventListener('click', () => {
       scale = 1;
-      panX = 0;
-      panY = 0;
-      applyTransform();
+      panX = 20;
+      panY = 20;
+      queueDraw();
     });
 
-    applyTransform();
+    window.addEventListener('resize', resizeCanvas);
+
+    async function loadScene() {
+      try {
+        const response = await fetch(sceneUrl, { cache: 'no-store' });
+        if (!response.ok) {
+          status.textContent = 'failed to fetch scene: ' + response.status;
+          return;
+        }
+        scene = await response.json();
+        resizeCanvas();
+      } catch (error) {
+        status.textContent = 'failed to fetch scene over HTTP';
+      }
+    }
+
+    resizeCanvas();
+    loadScene();
   </script>
 </body>
 </html>`;

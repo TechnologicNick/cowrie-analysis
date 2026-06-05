@@ -27,6 +27,14 @@ python honeypot/analysis/analyze_cowrie.py render `
 
 The `render` step reads only `cowrie_state_machine_graph.json` and does not reprocess the raw Cowrie logs.
 
+Serve the generated artifacts over HTTP with Bun so the interactive HTML can load the sibling SVG:
+
+```powershell
+bun run honeypot/analysis/serve_artifacts.ts --dir honeypot/analysis/artifacts --port 3000
+```
+
+Then open `http://localhost:3000/`.
+
 Analysis outputs:
 
 - `cowrie_sessions.parquet` or `cowrie_sessions.csv`
