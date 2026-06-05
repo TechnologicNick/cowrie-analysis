@@ -102,6 +102,10 @@ function polylinePath(section) {
   return `M ${first.x} ${first.y} ` + rest.map((point) => `L ${point.x} ${point.y}`).join(" ");
 }
 
+function sectionPoints(section) {
+  return [section.startPoint, ...(section.bendPoints ?? []), section.endPoint];
+}
+
 async function main() {
   const [, , inputArg, outputArg] = process.argv;
   if (!inputArg || !outputArg) {
@@ -134,11 +138,16 @@ async function main() {
     const strokeWidth = edgeStrokeWidth(meta.total_count);
     const sections = edge.sections ?? [];
     for (const section of sections) {
-      edgeSvg.push(
-        `<path d="${polylinePath(section)}" fill="none" stroke="${rgba(color, 0.42)}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round">` +
-          `<title>${escapeXml(`${meta.source_label} -> ${meta.target_label}\nbaseline=${meta.baseline_count}\nhostname=${meta.hostname_count}\ntotal=${meta.total_count}`)}</title>` +
-        `</path>`
-      );
+      const points = sectionPoints(section);
+      for (let index = 0; index < points.length - 1; index += 1) {
+        const startPoint = points[index];
+        const endPoint = points[index + 1];
+        edgeSvg.push(
+          `<line x1="${startPoint.x}" y1="${startPoint.y}" x2="${endPoint.x}" y2="${endPoint.y}" stroke="${rgba(color, 0.42)}" stroke-width="${strokeWidth}" stroke-linecap="round">` +
+            `<title>${escapeXml(`${meta.source_label} -> ${meta.target_label}\nbaseline=${meta.baseline_count}\nhostname=${meta.hostname_count}\ntotal=${meta.total_count}`)}</title>` +
+          `</line>`
+        );
+      }
     }
   }
 
