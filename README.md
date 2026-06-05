@@ -35,6 +35,9 @@ bun run honeypot/analysis/serve_artifacts.ts --dir honeypot/analysis/artifacts -
 
 Then open `http://localhost:3000/`.
 
+- Hover a node to see baseline, hostname, and total session counts.
+- Click a node to populate the right-hand sidebar with the top full flows through that node.
+
 Analysis outputs:
 
 - `cowrie_sessions.parquet` or `cowrie_sessions.csv`

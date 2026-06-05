@@ -148,9 +148,16 @@ function buildSceneData(graphData, laidOut, nodeMeta, edgeMeta, width, height, t
       stroke,
       strokeWidth: nodeStrokeWidth(meta.total_count),
       text: meta.display_label,
+      fullLabel: meta.full_display_label,
+      nodeType: meta.node_type,
+      stepIndex: meta.step_index,
+      commandFamily: meta.command_family,
       textColor,
       fontSize: 12,
+      baselineCount: meta.baseline_count,
+      hostnameCount: meta.hostname_count,
       totalCount: meta.total_count,
+      topFlows: meta.top_flows ?? [],
       bounds: {
         minX: node.x ?? 0,
         minY: node.y ?? 0,
@@ -372,6 +379,7 @@ async function main() {
       --muted: #5b5b5b;
       --border: #d6cfbe;
       --accent: #1f4e79;
+      --sidebar-width: 380px;
     }
     * { box-sizing: border-box; }
     body {
@@ -379,11 +387,19 @@ async function main() {
       background: var(--bg);
       color: var(--text);
       font-family: "Segoe UI", Arial, sans-serif;
+      min-height: 100vh;
+    }
+    .app {
+      display: flex;
+      min-height: 100vh;
+    }
+    .main {
+      flex: 1 1 auto;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
     }
     .toolbar {
-      position: sticky;
-      top: 0;
-      z-index: 10;
       display: flex;
       gap: 12px;
       align-items: center;
@@ -413,10 +429,11 @@ async function main() {
       font-size: 13px;
     }
     .viewport {
-      width: 100vw;
-      height: calc(100vh - 58px);
-      overflow: hidden;
+      position: relative;
+      flex: 1 1 auto;
+      min-height: 0;
       cursor: grab;
+      overflow: hidden;
       background:
         radial-gradient(circle at top left, rgba(31,78,121,0.08), transparent 26%),
         linear-gradient(180deg, #fbf8f0 0%, #f3ecdf 100%);
@@ -438,25 +455,145 @@ async function main() {
       color: var(--muted);
       font-size: 12px;
     }
+    .tooltip {
+      position: absolute;
+      z-index: 12;
+      min-width: 220px;
+      max-width: 320px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: rgba(255, 250, 240, 0.97);
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.12);
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(4px);
+      transition: opacity 100ms ease, transform 100ms ease;
+    }
+    .tooltip.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .tooltip .title {
+      margin: 0 0 6px 0;
+      font-size: 13px;
+      font-weight: 600;
+      word-break: break-word;
+    }
+    .tooltip .meta-line {
+      font-size: 12px;
+      color: var(--muted);
+      margin: 2px 0;
+    }
+    .sidebar {
+      width: var(--sidebar-width);
+      flex: 0 0 var(--sidebar-width);
+      border-left: 1px solid var(--border);
+      background: linear-gradient(180deg, #fffaf0 0%, #f6efdf 100%);
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    .sidebar-header {
+      padding: 16px 18px 12px 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .sidebar-header h2 {
+      margin: 0 0 6px 0;
+      font-size: 16px;
+    }
+    .sidebar-header p {
+      margin: 0;
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .sidebar-body {
+      padding: 16px 18px 24px 18px;
+      overflow: auto;
+      flex: 1 1 auto;
+    }
+    .selection-card {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.7);
+      padding: 14px;
+      margin-bottom: 16px;
+    }
+    .selection-card h3 {
+      margin: 0 0 8px 0;
+      font-size: 14px;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .selection-card .meta-line {
+      margin: 4px 0;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .flow-list {
+      display: grid;
+      gap: 12px;
+    }
+    .flow-item {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.7);
+      padding: 12px 13px;
+    }
+    .flow-item .counts {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .flow-item .path {
+      font-size: 13px;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+    .empty-state {
+      border: 1px dashed var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.4);
+      line-height: 1.5;
+    }
   </style>
 </head>
 <body>
-  <div class="toolbar">
-    <h1>${escapeXml(title)}</h1>
-    <button type="button" id="zoomIn">Zoom In</button>
-    <button type="button" id="zoomOut">Zoom Out</button>
-    <button type="button" id="resetView">Reset</button>
-    <div class="meta">wheel: zoom, drag: pan, range: ${escapeXml((graphData.meta.from_date ?? "start") + ".." + (graphData.meta.to_date ?? "end"))}</div>
-  </div>
-  <div class="viewport" id="viewport">
-    <canvas class="stage" id="stage"></canvas>
-    <div class="status" id="status">loading scene...</div>
+  <div class="app">
+    <main class="main">
+      <div class="toolbar">
+        <h1>${escapeXml(title)}</h1>
+        <button type="button" id="zoomIn">Zoom In</button>
+        <button type="button" id="zoomOut">Zoom Out</button>
+        <button type="button" id="resetView">Reset</button>
+        <div class="meta">wheel: zoom, drag: pan, click node: inspect flows, range: ${escapeXml((graphData.meta.from_date ?? "start") + ".." + (graphData.meta.to_date ?? "end"))}</div>
+      </div>
+      <div class="viewport" id="viewport">
+        <canvas class="stage" id="stage"></canvas>
+        <div class="tooltip" id="tooltip"></div>
+        <div class="status" id="status">loading scene...</div>
+      </div>
+    </main>
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h2>Node Flows</h2>
+        <p>Hover a node for per-sensor session counts. Click a node to inspect the dominant full start-to-end flows that pass through it.</p>
+      </div>
+      <div class="sidebar-body" id="sidebarBody">
+        <div class="empty-state">No node selected.</div>
+      </div>
+    </aside>
   </div>
   <script>
     const viewport = document.getElementById('viewport');
     const stage = document.getElementById('stage');
     const ctx = stage.getContext('2d');
     const status = document.getElementById('status');
+    const tooltip = document.getElementById('tooltip');
+    const sidebarBody = document.getElementById('sidebarBody');
     const zoomIn = document.getElementById('zoomIn');
     const zoomOut = document.getElementById('zoomOut');
     const resetView = document.getElementById('resetView');
@@ -470,6 +607,18 @@ async function main() {
     let lastY = 0;
     let deviceScale = Math.max(1, window.devicePixelRatio || 1);
     let drawQueued = false;
+    let movedDuringDrag = false;
+    let hoveredNodeId = null;
+    let selectedNodeId = null;
+
+    function escapeHtml(text) {
+      return String(text)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
 
     function intersects(a, b) {
       return !(a.maxX < b.minX || a.minX > b.maxX || a.maxY < b.minY || a.minY > b.maxY);
@@ -489,7 +638,95 @@ async function main() {
     function updateStatus() {
       const nodeCount = scene ? scene.nodes.length : 0;
       const edgeCount = scene ? scene.edges.length : 0;
-      status.textContent = 'zoom ' + scale.toFixed(2) + 'x | pan ' + Math.round(panX) + ', ' + Math.round(panY) + ' | nodes ' + nodeCount + ' | edges ' + edgeCount;
+      const selectedNode = getSelectedNode();
+      const selectedText = selectedNode ? ' | selected ' + selectedNode.fullLabel : '';
+      status.textContent = 'zoom ' + scale.toFixed(2) + 'x | pan ' + Math.round(panX) + ', ' + Math.round(panY) + ' | nodes ' + nodeCount + ' | edges ' + edgeCount + selectedText;
+    }
+
+    function getSelectedNode() {
+      if (!scene || !selectedNodeId) return null;
+      return scene.nodes.find((node) => node.id === selectedNodeId) || null;
+    }
+
+    function getHoveredNode() {
+      if (!scene || !hoveredNodeId) return null;
+      return scene.nodes.find((node) => node.id === hoveredNodeId) || null;
+    }
+
+    function worldFromClient(clientX, clientY) {
+      const rect = viewport.getBoundingClientRect();
+      const px = clientX - rect.left;
+      const py = clientY - rect.top;
+      return {
+        x: (px - panX) / scale,
+        y: (py - panY) / scale,
+        px,
+        py,
+      };
+    }
+
+    function pickNode(clientX, clientY) {
+      if (!scene) return null;
+      const point = worldFromClient(clientX, clientY);
+      for (let index = scene.nodes.length - 1; index >= 0; index -= 1) {
+        const node = scene.nodes[index];
+        if (point.x >= node.bounds.minX && point.x <= node.bounds.maxX && point.y >= node.bounds.minY && point.y <= node.bounds.maxY) {
+          return node;
+        }
+      }
+      return null;
+    }
+
+    function updateTooltip(node, clientX, clientY) {
+      if (!node) {
+        tooltip.classList.remove('visible');
+        tooltip.innerHTML = '';
+        return;
+      }
+      const extra = node.commandFamily ? '<div class="meta-line">family: ' + escapeHtml(node.commandFamily) + '</div>' : '';
+      tooltip.innerHTML =
+        '<div class="title">' + escapeHtml(node.fullLabel) + '</div>' +
+        '<div class="meta-line">step: ' + node.stepIndex + '</div>' +
+        '<div class="meta-line">baseline sessions: ' + node.baselineCount + '</div>' +
+        '<div class="meta-line">hostname sessions: ' + node.hostnameCount + '</div>' +
+        '<div class="meta-line">total sessions: ' + node.totalCount + '</div>' +
+        extra;
+      const rect = viewport.getBoundingClientRect();
+      const offsetX = 18;
+      const offsetY = 18;
+      const maxLeft = Math.max(8, rect.width - 340);
+      const maxTop = Math.max(8, rect.height - 170);
+      const left = Math.min(maxLeft, Math.max(8, clientX - rect.left + offsetX));
+      const top = Math.min(maxTop, Math.max(8, clientY - rect.top + offsetY));
+      tooltip.style.left = left + 'px';
+      tooltip.style.top = top + 'px';
+      tooltip.classList.add('visible');
+    }
+
+    function renderSidebar(node) {
+      if (!node) {
+        sidebarBody.innerHTML = '<div class="empty-state">No node selected.</div>';
+        return;
+      }
+      const flowItems = (node.topFlows || []).map((flow, index) =>
+        '<article class="flow-item">' +
+          '<div class="counts">#' + (index + 1) + ' | total ' + flow.total_count + ' | baseline ' + flow.baseline_count + ' | hostname ' + flow.hostname_count + '</div>' +
+          '<div class="path">' + escapeHtml(flow.path) + '</div>' +
+        '</article>'
+      ).join('');
+      const familyLine = node.commandFamily ? '<div class="meta-line">family: ' + escapeHtml(node.commandFamily) + '</div>' : '';
+      sidebarBody.innerHTML =
+        '<section class="selection-card">' +
+          '<h3>' + escapeHtml(node.fullLabel) + '</h3>' +
+          '<div class="meta-line">step ' + node.stepIndex + '</div>' +
+          '<div class="meta-line">baseline sessions: ' + node.baselineCount + '</div>' +
+          '<div class="meta-line">hostname sessions: ' + node.hostnameCount + '</div>' +
+          '<div class="meta-line">total sessions: ' + node.totalCount + '</div>' +
+          familyLine +
+        '</section>' +
+        ((node.topFlows && node.topFlows.length > 0)
+          ? '<div class="flow-list">' + flowItems + '</div>'
+          : '<div class="empty-state">No full-path summaries were recorded for this node.</div>');
     }
 
     function drawBackground(widthCss, heightCss) {
@@ -572,6 +809,15 @@ async function main() {
           ctx.strokeStyle = node.stroke;
           ctx.lineWidth = node.strokeWidth;
           ctx.stroke();
+          if (node.id === selectedNodeId) {
+            ctx.strokeStyle = '#0f3558';
+            ctx.lineWidth = Math.max(2.4, node.strokeWidth + 1.4);
+            ctx.stroke();
+          } else if (node.id === hoveredNodeId) {
+            ctx.strokeStyle = '#111111';
+            ctx.lineWidth = Math.max(1.8, node.strokeWidth + 0.8);
+            ctx.stroke();
+          }
           ctx.fillStyle = node.textColor;
           ctx.font = node.fontSize + 'px Segoe UI, Arial, sans-serif';
           ctx.fillText(node.text, x + 12, y + Math.round(h / 2) + 4);
@@ -626,23 +872,60 @@ async function main() {
 
     viewport.addEventListener('mousedown', (event) => {
       dragging = true;
+      movedDuringDrag = false;
       lastX = event.clientX;
       lastY = event.clientY;
       viewport.classList.add('dragging');
     });
 
     window.addEventListener('mousemove', (event) => {
-      if (!dragging) return;
-      panX += event.clientX - lastX;
-      panY += event.clientY - lastY;
-      lastX = event.clientX;
-      lastY = event.clientY;
-      queueDraw();
+      if (dragging) {
+        const dx = event.clientX - lastX;
+        const dy = event.clientY - lastY;
+        if (Math.abs(dx) > 0 || Math.abs(dy) > 0) {
+          movedDuringDrag = true;
+        }
+        panX += dx;
+        panY += dy;
+        lastX = event.clientX;
+        lastY = event.clientY;
+        tooltip.classList.remove('visible');
+        queueDraw();
+        return;
+      }
+      const nextNode = pickNode(event.clientX, event.clientY);
+      const nextId = nextNode ? nextNode.id : null;
+      if (nextId !== hoveredNodeId) {
+        hoveredNodeId = nextId;
+        viewport.style.cursor = nextNode ? 'pointer' : 'grab';
+        queueDraw();
+      }
+      updateTooltip(nextNode, event.clientX, event.clientY);
     });
 
     window.addEventListener('mouseup', () => {
       dragging = false;
       viewport.classList.remove('dragging');
+    });
+
+    viewport.addEventListener('mouseleave', () => {
+      if (hoveredNodeId !== null) {
+        hoveredNodeId = null;
+        viewport.style.cursor = 'grab';
+        queueDraw();
+      }
+      tooltip.classList.remove('visible');
+    });
+
+    viewport.addEventListener('click', (event) => {
+      if (movedDuringDrag) {
+        movedDuringDrag = false;
+        return;
+      }
+      const node = pickNode(event.clientX, event.clientY);
+      selectedNodeId = node ? node.id : null;
+      renderSidebar(node);
+      queueDraw();
     });
 
     zoomIn.addEventListener('click', () => zoomAt(1.2, viewport.clientWidth / 2, viewport.clientHeight / 2));
@@ -664,6 +947,7 @@ async function main() {
           return;
         }
         scene = await response.json();
+        renderSidebar(null);
         resizeCanvas();
       } catch (error) {
         status.textContent = 'failed to fetch scene over HTTP';

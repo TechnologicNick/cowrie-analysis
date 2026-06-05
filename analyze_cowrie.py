@@ -431,10 +431,15 @@ def compute_model_order(nodes_df: pd.DataFrame, edges_df: pd.DataFrame) -> pd.Da
     return work.sort_values(["step_index", "model_order", "label"]).reset_index(drop=True)
 
 
-def build_session_paths(events: pd.DataFrame, sensors: list[str]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def build_session_paths(
+    events: pd.DataFrame,
+    sensors: list[str],
+    max_node_flows: int = 12,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     node_counter: dict[tuple[int, str, str], dict[str, Any]] = {}
     edge_counter: dict[tuple[tuple[int, str, str], tuple[int, str, str]], dict[str, Any]] = {}
     path_prefix_counter: dict[str, Counter[tuple[str, ...]]] = {sensor: Counter() for sensor in sensors}
+    node_flow_counter: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
     session_path_rows: list[dict[str, Any]] = []
 
     for (sensor, session), session_events in events.groupby(["sensor", "session"], sort=False):
@@ -486,21 +491,26 @@ def build_session_paths(events: pd.DataFrame, sensors: list[str]) -> tuple[pd.Da
             )
             prefix_labels.append("still_open")
 
+        full_path_labels = [node["full_display_label"] for node in path_nodes]
+        full_path = " -> ".join(full_path_labels)
+
         path_prefix_counter[sensor][tuple(prefix_labels[:8])] += 1
         session_path_rows.append(
             {
                 "sensor": sensor,
                 "session": session,
                 "path_length": len(path_nodes) - 1,
+                "full_path": full_path,
                 "path_preview": " -> ".join(prefix_labels[:12]),
             }
         )
 
         for node in path_nodes:
             node_key = (node["step_index"], node["label"], node["node_type"])
+            node_id = f"{node['step_index']}|{node['node_type']}|{node['label']}"
             if node_key not in node_counter:
                 node_counter[node_key] = {
-                    "node_id": f"{node['step_index']}|{node['node_type']}|{node['label']}",
+                    "node_id": node_id,
                     "step_index": node["step_index"],
                     "label": node["label"],
                     "display_label": node["display_label"],
@@ -511,6 +521,7 @@ def build_session_paths(events: pd.DataFrame, sensors: list[str]) -> tuple[pd.Da
                     "hostname_count": 0,
                 }
             node_counter[node_key][f"{sensor}_count"] += 1
+            node_flow_counter[node_id][(sensor, full_path)] += 1
 
         for source_node, target_node in zip(path_nodes, path_nodes[1:]):
             edge_key = (
@@ -536,6 +547,25 @@ def build_session_paths(events: pd.DataFrame, sensors: list[str]) -> tuple[pd.Da
         lambda row: row["command_family"] if row["node_type"] == "command" else ("terminal" if row["node_type"] == "terminal" else row["node_type"]),
         axis=1,
     )
+    top_flow_records: list[list[dict[str, Any]]] = []
+    for node_id in nodes_df["node_id"]:
+        combined: dict[str, dict[str, Any]] = {}
+        for (sensor, path), count in node_flow_counter.get(node_id, Counter()).items():
+            if path not in combined:
+                combined[path] = {
+                    "path": path,
+                    "baseline_count": 0,
+                    "hostname_count": 0,
+                    "total_count": 0,
+                }
+            combined[path][f"{sensor}_count"] += int(count)
+            combined[path]["total_count"] += int(count)
+        ranked = sorted(
+            combined.values(),
+            key=lambda item: (-item["total_count"], -item["baseline_count"], -item["hostname_count"], item["path"]),
+        )
+        top_flow_records.append(ranked[:max_node_flows])
+    nodes_df["top_flows"] = top_flow_records
 
     edges_df = pd.DataFrame(edge_counter.values())
     edges_df["total_count"] = edges_df["baseline_count"] + edges_df["hostname_count"]
