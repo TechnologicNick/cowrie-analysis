@@ -21,11 +21,10 @@ services:
   render:
     build:
       context: .
-      dockerfile: Dockerfile.viewer
+      dockerfile: Dockerfile.node
     working_dir: /workspace
     command:
-      - bun
-      - run
+      - node
       - honeypot/analysis/render_state_machine.mjs
       - honeypot/analysis/artifacts/cowrie_state_machine_graph.json
       - honeypot/analysis/artifacts/cowrie_state_machine.svg

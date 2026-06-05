@@ -1,6 +1,11 @@
 import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import ELK from "elkjs/lib/elk.bundled.js";
+
+const require = createRequire(import.meta.url);
+const elkWorkerModule = require("elkjs/lib/elk-worker.min.js");
+const ElkWorker = elkWorkerModule.Worker ?? elkWorkerModule.default ?? elkWorkerModule;
 
 const NODE_COLORS = {
   root: "#1f4e79",
@@ -260,7 +265,9 @@ async function main() {
     graphData.edges.map((edge, index) => [`e${index}`, edge]),
   );
 
-  const elk = new ELK();
+  const elk = new ELK({
+    workerFactory: (url) => new ElkWorker(url),
+  });
   const laidOut = await elk.layout(buildElkGraph(graphData));
 
   const width = Math.ceil((laidOut.width ?? 1000) + 60);

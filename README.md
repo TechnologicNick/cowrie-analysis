@@ -50,7 +50,8 @@ Run the services in this order from `honeypot/analysis`.
 This uses separate images:
 
 - `Dockerfile.viewer` for the Bun HTTP viewer
-- `Dockerfile.python` for `analyze` and `render`
+- `Dockerfile.python` for `analyze`
+- `Dockerfile.node` for `render`
 
 1. Run analysis.
    This also processes all available live data by default. Add `--from` / `--to` only when you want a narrower window.

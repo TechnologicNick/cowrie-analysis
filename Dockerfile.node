@@ -1,0 +1,11 @@
+FROM node:24-bookworm-slim
+
+WORKDIR /workspace/honeypot/analysis
+
+COPY package.json ./
+
+RUN npm install --omit=dev
+
+COPY render_state_machine.mjs ./
+
+CMD ["node", "honeypot/analysis/render_state_machine.mjs", "honeypot/analysis/artifacts/cowrie_state_machine_graph.json", "honeypot/analysis/artifacts/cowrie_state_machine.svg"]
