@@ -1,24 +1,27 @@
 # Cowrie analysis
 
-Install the renderer dependency once:
+## Local workflow
+
+Run the scripts in this order.
+
+1. Install dependencies once:
 
 ```powershell
 cd honeypot/analysis
-npm install
+bun install
 ```
 
-Run analysis from the repo root:
+2. Run analysis from the repo root.
+   This processes all available live data by default. Add `--from` / `--to` only when you want to limit the date range.
 
 ```powershell
 python honeypot/analysis/analyze_cowrie.py analyze `
   --input-root honeypot/outputs `
   --artifact-dir honeypot/analysis/artifacts `
-  --from 2026-05-30 `
-  --to 2026-06-04 `
   --sensors baseline,hostname
 ```
 
-Render the visualization from the previously generated graph JSON:
+3. Render the visualization from the previously generated graph JSON:
 
 ```powershell
 python honeypot/analysis/analyze_cowrie.py render `
@@ -27,18 +30,49 @@ python honeypot/analysis/analyze_cowrie.py render `
 
 The `render` step reads only `cowrie_state_machine_graph.json` and does not reprocess the raw Cowrie logs.
 
-Serve the generated artifacts over HTTP with Bun so the interactive HTML can load the sibling SVG:
+4. Serve the generated artifacts over HTTP with Bun so the interactive HTML can load the sibling SVG:
 
 ```powershell
 bun run honeypot/analysis/serve_artifacts.ts --dir honeypot/analysis/artifacts --port 3000
 ```
 
-Then open `http://localhost:3000/`.
+5. Open `http://localhost:3000/`.
 
 - Hover a node to see baseline, hostname, and total session counts.
 - Click a node to populate the right-hand sidebar with the top full flows through that node.
 - Sidebar flow entries render one state per line, reuse the node colors, and include sample session links into Splunk.
 - The selected node card also includes a direct Splunk search link for that node.
+
+## Container workflow
+
+Run the services in this order from `honeypot/analysis`.
+
+This uses separate images:
+
+- `Dockerfile.viewer` for the Bun HTTP viewer
+- `Dockerfile.python` for `analyze` and `render`
+
+1. Run analysis.
+   This also processes all available live data by default. Add `--from` / `--to` only when you want a narrower window.
+
+```powershell
+cd honeypot/analysis
+docker compose --profile tools run --rm analyze
+```
+
+2. Run render.
+
+```powershell
+cd honeypot/analysis
+docker compose --profile tools run --rm render
+```
+
+3. Start the viewer.
+
+```powershell
+cd honeypot/analysis
+docker compose up viewer
+```
 
 Analysis outputs:
 

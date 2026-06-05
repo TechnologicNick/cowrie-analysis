@@ -23,13 +23,6 @@ const mimeTypes: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
 };
 
-function safeJoin(root: string, requestPath: string): string | null {
-  const decoded = decodeURIComponent(requestPath);
-  const normalized = path.normalize(decoded).replace(/^([/\\])+/, "");
-  const resolved = path.resolve(root, normalized);
-  return resolved.startsWith(root) ? resolved : null;
-}
-
 function fileResponse(filePath: string): Response {
   const ext = path.extname(filePath).toLowerCase();
   const type = mimeTypes[ext] ?? "application/octet-stream";

@@ -1,0 +1,55 @@
+services:
+  viewer:
+    build:
+      context: .
+      dockerfile: Dockerfile.viewer
+    working_dir: /workspace
+    command:
+      - bun
+      - run
+      - honeypot/analysis/serve_artifacts.ts
+      - --dir
+      - honeypot/analysis/artifacts
+      - --port
+      - "3000"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../..:/workspace
+    restart: unless-stopped
+
+  render:
+    build:
+      context: .
+      dockerfile: Dockerfile.viewer
+    working_dir: /workspace
+    command:
+      - bun
+      - run
+      - honeypot/analysis/render_state_machine.mjs
+      - honeypot/analysis/artifacts/cowrie_state_machine_graph.json
+      - honeypot/analysis/artifacts/cowrie_state_machine.svg
+    volumes:
+      - ../..:/workspace
+    profiles:
+      - tools
+
+  analyze:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    working_dir: /workspace
+    command:
+      - python
+      - honeypot/analysis/analyze_cowrie.py
+      - analyze
+      - --input-root
+      - honeypot/outputs
+      - --artifact-dir
+      - honeypot/analysis/artifacts
+      - --sensors
+      - baseline,hostname
+    volumes:
+      - ../..:/workspace
+    profiles:
+      - tools

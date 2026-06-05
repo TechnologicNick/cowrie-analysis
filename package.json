@@ -4,5 +4,8 @@
   "type": "module",
   "dependencies": {
     "elkjs": "0.11.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14"
   }
 }
