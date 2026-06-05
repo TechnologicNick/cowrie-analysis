@@ -16,6 +16,7 @@ services:
       - "3000:3000"
     volumes:
       - ../..:/workspace
+      - /workspace/honeypot/analysis/node_modules
     restart: unless-stopped
 
   render:
@@ -30,6 +31,7 @@ services:
       - honeypot/analysis/artifacts/cowrie_state_machine.svg
     volumes:
       - ../..:/workspace
+      - /workspace/honeypot/analysis/node_modules
     profiles:
       - tools
 

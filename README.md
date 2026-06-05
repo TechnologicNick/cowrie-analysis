@@ -62,9 +62,11 @@ docker compose --profile tools run --rm analyze
 ```
 
 2. Run render.
+   Rebuild first if you changed any Dockerfile or JS dependency.
 
 ```powershell
 cd honeypot/analysis
+docker compose --profile tools build render
 docker compose --profile tools run --rm render
 ```
 
