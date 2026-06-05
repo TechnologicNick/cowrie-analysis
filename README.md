@@ -37,6 +37,8 @@ Then open `http://localhost:3000/`.
 
 - Hover a node to see baseline, hostname, and total session counts.
 - Click a node to populate the right-hand sidebar with the top full flows through that node.
+- Sidebar flow entries render one state per line, reuse the node colors, and include sample session links into Splunk.
+- The selected node card also includes a direct Splunk search link for that node.
 
 Analysis outputs:
 

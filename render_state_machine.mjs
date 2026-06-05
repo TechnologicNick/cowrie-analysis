@@ -149,9 +149,12 @@ function buildSceneData(graphData, laidOut, nodeMeta, edgeMeta, width, height, t
       strokeWidth: nodeStrokeWidth(meta.total_count),
       text: meta.display_label,
       fullLabel: meta.full_display_label,
+      rawLabel: meta.label,
       nodeType: meta.node_type,
       stepIndex: meta.step_index,
       commandFamily: meta.command_family,
+      colorKey: meta.color_key,
+      sourceEventId: meta.source_eventid ?? "",
       textColor,
       fontSize: 12,
       baselineCount: meta.baseline_count,
@@ -531,6 +534,30 @@ async function main() {
       font-size: 13px;
       color: var(--muted);
     }
+    .selection-actions,
+    .flow-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .action-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: #ffffff;
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .action-link:hover {
+      border-color: var(--accent);
+    }
     .flow-list {
       display: grid;
       gap: 12px;
@@ -546,9 +573,15 @@ async function main() {
       color: var(--muted);
       margin-bottom: 6px;
     }
-    .flow-item .path {
-      font-size: 13px;
-      line-height: 1.45;
+    .flow-steps {
+      display: grid;
+      gap: 6px;
+    }
+    .flow-step {
+      border-radius: 9px;
+      padding: 8px 10px;
+      font-size: 12px;
+      line-height: 1.35;
       word-break: break-word;
     }
     .empty-state {
@@ -598,6 +631,9 @@ async function main() {
     const zoomOut = document.getElementById('zoomOut');
     const resetView = document.getElementById('resetView');
     const sceneUrl = '/cowrie_state_machine.scene.json';
+    const splunkBaseUrl = 'http://10.20.0.36:8000/en-US/app/search/search?q=';
+    const splunkTimeSuffix = '&earliest=0&latest=';
+    const nodeColors = ${JSON.stringify(NODE_COLORS)};
     let scene = null;
     let scale = 1;
     let panX = 20;
@@ -610,6 +646,10 @@ async function main() {
     let movedDuringDrag = false;
     let hoveredNodeId = null;
     let selectedNodeId = null;
+    let velocityX = 0;
+    let velocityY = 0;
+    let inertiaFrame = 0;
+    let lastDragAt = 0;
 
     function escapeHtml(text) {
       return String(text)
@@ -641,6 +681,13 @@ async function main() {
       const selectedNode = getSelectedNode();
       const selectedText = selectedNode ? ' | selected ' + selectedNode.fullLabel : '';
       status.textContent = 'zoom ' + scale.toFixed(2) + 'x | pan ' + Math.round(panX) + ', ' + Math.round(panY) + ' | nodes ' + nodeCount + ' | edges ' + edgeCount + selectedText;
+    }
+
+    function stopInertia() {
+      if (inertiaFrame) {
+        window.cancelAnimationFrame(inertiaFrame);
+        inertiaFrame = 0;
+      }
     }
 
     function getSelectedNode() {
@@ -708,13 +755,30 @@ async function main() {
         sidebarBody.innerHTML = '<div class="empty-state">No node selected.</div>';
         return;
       }
-      const flowItems = (node.topFlows || []).map((flow, index) =>
+      const flowItems = (node.topFlows || []).map((flow, index) => {
+        const stepsHtml = (flow.steps || []).map((step) => {
+          const fill = nodeColors[step.color_key] || nodeColors.other;
+          const textColor = (step.color_key === 'root' || step.color_key === 'terminal') ? '#f8f6f1' : '#111111';
+          return '<div class="flow-step" style="background:' + escapeHtml(fill) + '; color:' + escapeHtml(textColor) + ';">' + escapeHtml(step.display_label) + '</div>';
+        }).join('');
+        const sessionLinks = (flow.sample_sessions || []).map((sample) =>
+          '<a class="action-link" target="_blank" rel="noreferrer" href="' + escapeHtml(buildSplunkUrlForSession(sample)) + '">' +
+            'Open ' + escapeHtml(sample.sensor) + ' ' + escapeHtml(sample.session) +
+          '</a>'
+        ).join('');
+        return (
         '<article class="flow-item">' +
           '<div class="counts">#' + (index + 1) + ' | total ' + flow.total_count + ' | baseline ' + flow.baseline_count + ' | hostname ' + flow.hostname_count + '</div>' +
-          '<div class="path">' + escapeHtml(flow.path) + '</div>' +
+          '<div class="flow-steps">' + stepsHtml + '</div>' +
+          (sessionLinks ? '<div class="flow-actions">' + sessionLinks + '</div>' : '') +
         '</article>'
-      ).join('');
+        );
+      }).join('');
       const familyLine = node.commandFamily ? '<div class="meta-line">family: ' + escapeHtml(node.commandFamily) + '</div>' : '';
+      const nodeLink = buildSplunkUrlForNode(node);
+      const nodeActions = nodeLink
+        ? '<div class="selection-actions"><a class="action-link" target="_blank" rel="noreferrer" href="' + escapeHtml(nodeLink) + '">Open Node In Splunk</a></div>'
+        : '';
       sidebarBody.innerHTML =
         '<section class="selection-card">' +
           '<h3>' + escapeHtml(node.fullLabel) + '</h3>' +
@@ -723,10 +787,59 @@ async function main() {
           '<div class="meta-line">hostname sessions: ' + node.hostnameCount + '</div>' +
           '<div class="meta-line">total sessions: ' + node.totalCount + '</div>' +
           familyLine +
+          nodeActions +
         '</section>' +
         ((node.topFlows && node.topFlows.length > 0)
           ? '<div class="flow-list">' + flowItems + '</div>'
           : '<div class="empty-state">No full-path summaries were recorded for this node.</div>');
+    }
+
+    function buildSplunkUrl(query) {
+      return splunkBaseUrl + encodeURIComponent(query) + splunkTimeSuffix;
+    }
+
+    function escapeSplunkValue(value) {
+      return JSON.stringify(String(value)).slice(1, -1);
+    }
+
+    function escapeRegex(value) {
+      return String(value).replace(/[|\\\\{}()\\[\\]^$+*?.]/g, '\\\\$&');
+    }
+
+    function buildCommandPrefilter(command) {
+      const candidates = String(command)
+        .split(/\\s+/)
+        .map((token) => token.replace(/^["'()\\[\\]{};,:]+|["'()\\[\\]{};,:]+$/g, '').replaceAll('*', ''))
+        .filter((token) => token.length >= 4 && /[A-Za-z0-9]/.test(token));
+      if (candidates.length === 0) {
+        return '';
+      }
+      candidates.sort((left, right) => right.length - left.length || left.localeCompare(right));
+      return candidates[0];
+    }
+
+    function buildSplunkUrlForNode(node) {
+      let query = 'search index="cowrie"';
+      if (node.nodeType === 'command') {
+        const prefilter = buildCommandPrefilter(node.rawLabel);
+        query += ' eventid="cowrie.command.input"';
+        if (prefilter) {
+          query += ' "' + escapeSplunkValue(prefilter) + '"';
+        }
+        query += ' | regex input="^' + escapeSplunkValue(escapeRegex(node.rawLabel)) + '$"';
+      } else if (node.sourceEventId) {
+        query += ' eventid="' + escapeSplunkValue(node.sourceEventId) + '"';
+      } else if (node.nodeType === 'root') {
+        return buildSplunkUrl(query);
+      } else {
+        return '';
+      }
+      return buildSplunkUrl(query);
+    }
+
+    function buildSplunkUrlForSession(sample) {
+      const sessionValue = escapeSplunkValue(sample.session);
+      return buildSplunkUrl('search index="cowrie" session="' + sessionValue + '"');
     }
 
     function drawBackground(widthCss, heightCss) {
@@ -871,10 +984,14 @@ async function main() {
     }, { passive: false });
 
     viewport.addEventListener('mousedown', (event) => {
+      stopInertia();
       dragging = true;
       movedDuringDrag = false;
+      velocityX = 0;
+      velocityY = 0;
       lastX = event.clientX;
       lastY = event.clientY;
+      lastDragAt = performance.now();
       viewport.classList.add('dragging');
     });
 
@@ -882,13 +999,18 @@ async function main() {
       if (dragging) {
         const dx = event.clientX - lastX;
         const dy = event.clientY - lastY;
+        const now = performance.now();
+        const dt = Math.max(8, now - lastDragAt);
         if (Math.abs(dx) > 0 || Math.abs(dy) > 0) {
           movedDuringDrag = true;
         }
         panX += dx;
         panY += dy;
+        velocityX = dx / dt * 16.6667;
+        velocityY = dy / dt * 16.6667;
         lastX = event.clientX;
         lastY = event.clientY;
+        lastDragAt = now;
         tooltip.classList.remove('visible');
         queueDraw();
         return;
@@ -904,8 +1026,12 @@ async function main() {
     });
 
     window.addEventListener('mouseup', () => {
+      const shouldStartInertia = dragging && (Math.abs(velocityX) > 0.4 || Math.abs(velocityY) > 0.4);
       dragging = false;
       viewport.classList.remove('dragging');
+      if (shouldStartInertia) {
+        startInertia();
+      }
     });
 
     viewport.addEventListener('mouseleave', () => {
@@ -931,9 +1057,12 @@ async function main() {
     zoomIn.addEventListener('click', () => zoomAt(1.2, viewport.clientWidth / 2, viewport.clientHeight / 2));
     zoomOut.addEventListener('click', () => zoomAt(1 / 1.2, viewport.clientWidth / 2, viewport.clientHeight / 2));
     resetView.addEventListener('click', () => {
+      stopInertia();
       scale = 1;
       panX = 20;
       panY = 20;
+      velocityX = 0;
+      velocityY = 0;
       queueDraw();
     });
 
@@ -952,6 +1081,27 @@ async function main() {
       } catch (error) {
         status.textContent = 'failed to fetch scene over HTTP';
       }
+    }
+
+    function startInertia() {
+      stopInertia();
+      const friction = 0.92;
+      const minVelocity = 0.08;
+      const tick = () => {
+        panX += velocityX;
+        panY += velocityY;
+        velocityX *= friction;
+        velocityY *= friction;
+        queueDraw();
+        if (Math.abs(velocityX) < minVelocity && Math.abs(velocityY) < minVelocity) {
+          velocityX = 0;
+          velocityY = 0;
+          inertiaFrame = 0;
+          return;
+        }
+        inertiaFrame = window.requestAnimationFrame(tick);
+      };
+      inertiaFrame = window.requestAnimationFrame(tick);
     }
 
     resizeCanvas();

@@ -136,7 +136,7 @@ class SessionSummary:
 
 
 def normalize_command(command: str) -> str:
-    return " ".join(command.strip().split())[:240]
+    return " ".join(command.strip().split())
 
 
 def display_label(label: str, limit: int = 44) -> str:
@@ -152,6 +152,9 @@ def node_label_prefix(node_type: str) -> str:
     }.get(node_type, node_type)
 
 
+DISPLAY_TO_EVENTID = {display: eventid for eventid, display in EVENT_LABELS.items()}
+
+
 def event_display_name(eventid: str) -> str:
     return EVENT_LABELS.get(eventid, eventid.replace("cowrie.", ""))
 
@@ -162,6 +165,10 @@ def classify_command(command: str) -> str:
         if any(pattern.search(command_lower) for pattern in patterns):
             return family
     return "other"
+
+
+def splunk_escape(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
 def iter_log_files(sensor_dir: Path) -> Iterable[Path]:
@@ -435,11 +442,12 @@ def build_session_paths(
     events: pd.DataFrame,
     sensors: list[str],
     max_node_flows: int = 12,
+    max_flow_sessions: int = 3,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     node_counter: dict[tuple[int, str, str], dict[str, Any]] = {}
     edge_counter: dict[tuple[tuple[int, str, str], tuple[int, str, str]], dict[str, Any]] = {}
     path_prefix_counter: dict[str, Counter[tuple[str, ...]]] = {sensor: Counter() for sensor in sensors}
-    node_flow_counter: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
+    node_flow_details: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     session_path_rows: list[dict[str, Any]] = []
 
     for (sensor, session), session_events in events.groupby(["sensor", "session"], sort=False):
@@ -451,6 +459,7 @@ def build_session_paths(
                 "command_family": "",
                 "display_label": f"root: {sensor}",
                 "full_display_label": f"root: {sensor}",
+                "source_eventid": "",
             }
         ]
         prefix_labels = [sensor]
@@ -460,10 +469,12 @@ def build_session_paths(
                 label = normalize_command(getattr(event, "input", "") or "")
                 node_type = "command"
                 command_family = classify_command(label)
+                source_eventid = "cowrie.command.input"
             else:
                 label = event_display_name(event.eventid)
                 node_type = "terminal" if event.eventid == "cowrie.session.closed" else "event"
                 command_family = ""
+                source_eventid = event.eventid
 
             prefix = node_label_prefix(node_type)
             path_nodes.append(
@@ -474,6 +485,7 @@ def build_session_paths(
                     "command_family": command_family,
                     "display_label": f"{prefix}: {display_label(label)}",
                     "full_display_label": f"{prefix}: {label}",
+                    "source_eventid": source_eventid,
                 }
             )
             prefix_labels.append(label)
@@ -487,12 +499,27 @@ def build_session_paths(
                     "command_family": "",
                     "display_label": "end: still_open",
                     "full_display_label": "end: still_open",
+                    "source_eventid": "",
                 }
             )
             prefix_labels.append("still_open")
 
         full_path_labels = [node["full_display_label"] for node in path_nodes]
         full_path = " -> ".join(full_path_labels)
+        flow_steps = [
+            {
+                "label": node["label"],
+                "display_label": node["full_display_label"],
+                "node_type": node["node_type"],
+                "command_family": node["command_family"],
+                "color_key": (
+                    node["command_family"]
+                    if node["node_type"] == "command"
+                    else ("terminal" if node["node_type"] == "terminal" else node["node_type"])
+                ),
+            }
+            for node in path_nodes
+        ]
 
         path_prefix_counter[sensor][tuple(prefix_labels[:8])] += 1
         session_path_rows.append(
@@ -517,11 +544,27 @@ def build_session_paths(
                     "full_display_label": node["full_display_label"],
                     "node_type": node["node_type"],
                     "command_family": node["command_family"],
+                    "source_eventid": node["source_eventid"],
                     "baseline_count": 0,
                     "hostname_count": 0,
                 }
             node_counter[node_key][f"{sensor}_count"] += 1
-            node_flow_counter[node_id][(sensor, full_path)] += 1
+            flow_detail = node_flow_details[node_id].get(full_path)
+            if flow_detail is None:
+                flow_detail = {
+                    "path": full_path,
+                    "sensor": sensor,
+                    "steps": flow_steps,
+                    "baseline_count": 0,
+                    "hostname_count": 0,
+                    "total_count": 0,
+                    "sample_sessions": [],
+                }
+                node_flow_details[node_id][full_path] = flow_detail
+            flow_detail[f"{sensor}_count"] += 1
+            flow_detail["total_count"] += 1
+            if len(flow_detail["sample_sessions"]) < max_flow_sessions:
+                flow_detail["sample_sessions"].append({"sensor": sensor, "session": session})
 
         for source_node, target_node in zip(path_nodes, path_nodes[1:]):
             edge_key = (
@@ -549,19 +592,8 @@ def build_session_paths(
     )
     top_flow_records: list[list[dict[str, Any]]] = []
     for node_id in nodes_df["node_id"]:
-        combined: dict[str, dict[str, Any]] = {}
-        for (sensor, path), count in node_flow_counter.get(node_id, Counter()).items():
-            if path not in combined:
-                combined[path] = {
-                    "path": path,
-                    "baseline_count": 0,
-                    "hostname_count": 0,
-                    "total_count": 0,
-                }
-            combined[path][f"{sensor}_count"] += int(count)
-            combined[path]["total_count"] += int(count)
         ranked = sorted(
-            combined.values(),
+            node_flow_details.get(node_id, {}).values(),
             key=lambda item: (-item["total_count"], -item["baseline_count"], -item["hostname_count"], item["path"]),
         )
         top_flow_records.append(ranked[:max_node_flows])
