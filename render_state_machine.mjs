@@ -19,11 +19,26 @@ const NODE_COLORS = {
   terminal: "#1b1b1b",
 };
 
-const EDGE_SENSOR_COLORS = {
-  baseline_only: "#1f4e79",
-  hostname_only: "#00796b",
-  both: "#625971",
-};
+const SENSOR_EDGE_PALETTE = [
+  "#1f4e79",
+  "#00796b",
+  "#b33c00",
+  "#7b1fa2",
+  "#0d6e6e",
+  "#8a5a00",
+  "#3f51b5",
+  "#5d4037",
+];
+
+function buildSensorEdgeColors(sensors) {
+  const colors = {};
+  for (const [index, sensor] of sensors.entries()) {
+    colors[sensor] = SENSOR_EDGE_PALETTE[index % SENSOR_EDGE_PALETTE.length];
+  }
+  colors.multiple = "#625971";
+  colors.none = "#625971";
+  return colors;
+}
 
 function escapeXml(text) {
   const cleaned = String(text).replaceAll(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
@@ -57,6 +72,12 @@ function edgeStrokeWidth(totalCount) {
 
 function nodeStrokeWidth(totalCount) {
   return Math.max(0.8, Math.min(2.6, 0.8 + Math.log10(Math.max(1, totalCount))));
+}
+
+function sensorCountLines(sensorCounts) {
+  return Object.entries(sensorCounts ?? {})
+    .map(([sensor, count]) => `${sensor}=${count}`)
+    .join("\n");
 }
 
 function buildElkGraph(graphData) {
@@ -131,7 +152,7 @@ function computeSegmentBounds(startPoint, endPoint) {
   };
 }
 
-function buildSceneData(graphData, laidOut, nodeMeta, edgeMeta, width, height, title) {
+function buildSceneData(graphData, laidOut, nodeMeta, edgeMeta, width, height, title, edgeSensorColors) {
   const sceneNodes = [];
   for (const node of laidOut.children ?? []) {
     const meta = nodeMeta.get(node.id);
@@ -162,8 +183,7 @@ function buildSceneData(graphData, laidOut, nodeMeta, edgeMeta, width, height, t
       sourceEventId: meta.source_eventid ?? "",
       textColor,
       fontSize: 12,
-      baselineCount: meta.baseline_count,
-      hostnameCount: meta.hostname_count,
+      sensorCounts: meta.sensor_counts ?? {},
       totalCount: meta.total_count,
       topFlows: meta.top_flows ?? [],
       bounds: {
@@ -179,7 +199,7 @@ function buildSceneData(graphData, laidOut, nodeMeta, edgeMeta, width, height, t
   for (const edge of laidOut.edges ?? []) {
     const meta = edgeMeta.get(edge.id);
     if (!meta) continue;
-    const color = EDGE_SENSOR_COLORS[meta.sensor_mix] ?? EDGE_SENSOR_COLORS.both;
+    const color = edgeSensorColors[meta.sensor_mix] ?? edgeSensorColors.multiple;
     for (const section of edge.sections ?? []) {
       const points = [section.startPoint, ...(section.bendPoints ?? []), section.endPoint];
       for (let index = 0; index < points.length - 1; index += 1) {
@@ -192,6 +212,7 @@ function buildSceneData(graphData, laidOut, nodeMeta, edgeMeta, width, height, t
           x2: endPoint.x,
           y2: endPoint.y,
           stroke: rgba(color, 0.42),
+          sensorCounts: meta.sensor_counts ?? {},
           strokeWidth: edgeStrokeWidth(meta.total_count),
           bounds: computeSegmentBounds(startPoint, endPoint),
         });
@@ -259,6 +280,7 @@ async function main() {
   const sceneOutputPath = outputPath.replace(/\.svg$/i, ".scene.json");
   const raw = await fs.readFile(inputPath, "utf-8");
   const graphData = JSON.parse(raw);
+  const edgeSensorColors = buildSensorEdgeColors(graphData.meta.sensors ?? []);
 
   const nodeMeta = new Map(graphData.nodes.map((node) => [node.node_id, node]));
   const edgeMeta = new Map(
@@ -277,7 +299,7 @@ async function main() {
   for (const edge of laidOut.edges ?? []) {
     const meta = edgeMeta.get(edge.id);
     if (!meta) continue;
-    const color = EDGE_SENSOR_COLORS[meta.sensor_mix] ?? EDGE_SENSOR_COLORS.both;
+    const color = edgeSensorColors[meta.sensor_mix] ?? edgeSensorColors.multiple;
     const strokeWidth = edgeStrokeWidth(meta.total_count);
     const sections = edge.sections ?? [];
     for (const section of sections) {
@@ -287,7 +309,7 @@ async function main() {
         const endPoint = points[index + 1];
         edgeSvg.push(
           `<line x1="${startPoint.x}" y1="${startPoint.y}" x2="${endPoint.x}" y2="${endPoint.y}" stroke="${rgba(color, 0.42)}" stroke-width="${strokeWidth}" stroke-linecap="round">` +
-            `<title>${escapeXml(`${meta.source_label} -> ${meta.target_label}\nbaseline=${meta.baseline_count}\nhostname=${meta.hostname_count}\ntotal=${meta.total_count}`)}</title>` +
+            `<title>${escapeXml(`${meta.source_label} -> ${meta.target_label}\n${sensorCountLines(meta.sensor_counts)}\ntotal=${meta.total_count}`)}</title>` +
           `</line>`
         );
       }
@@ -310,7 +332,7 @@ async function main() {
 
     nodeSvg.push(
       `<g class="node node-${escapeXml(meta.node_type)}" transform="translate(${x},${y})">` +
-        `<title>${escapeXml(`${meta.full_display_label}\nbaseline=${meta.baseline_count}\nhostname=${meta.hostname_count}\ntotal=${meta.total_count}\nstep=${meta.step_index}`)}</title>` +
+        `<title>${escapeXml(`${meta.full_display_label}\n${sensorCountLines(meta.sensor_counts)}\ntotal=${meta.total_count}\nstep=${meta.step_index}`)}</title>` +
         `<rect x="0" y="0" width="${widthNode}" height="${heightNode}" rx="${radius}" ry="${radius}" fill="${fill}" fill-opacity="0.92" stroke="${stroke}" stroke-width="${nodeStrokeWidth(meta.total_count)}" />` +
         `<text x="12" y="${Math.round(heightNode / 2) + 4}" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="${textColor}">${escapeXml(meta.display_label)}</text>` +
       `</g>`
@@ -354,7 +376,7 @@ async function main() {
   }).join("");
 
   const title = `Cowrie Session State Machine (${graphData.meta.session_count} sessions)`;
-  const sceneData = buildSceneData(graphData, laidOut, nodeMeta, edgeMeta, width, height, title);
+  const sceneData = buildSceneData(graphData, laidOut, nodeMeta, edgeMeta, width, height, title, edgeSensorColors);
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
   <rect x="0" y="0" width="${width}" height="${height}" fill="#f7f3ea" />
@@ -667,6 +689,18 @@ async function main() {
         .replaceAll("'", '&#39;');
     }
 
+    function sensorCountHtml(sensorCounts, labelSuffix) {
+      return Object.entries(sensorCounts || {})
+        .map(([sensor, count]) => '<div class="meta-line">' + escapeHtml(sensor) + ' ' + labelSuffix + ': ' + count + '</div>')
+        .join('');
+    }
+
+    function sensorCountSummary(sensorCounts) {
+      return Object.entries(sensorCounts || {})
+        .map(([sensor, count]) => sensor + ' ' + count)
+        .join(' | ');
+    }
+
     function intersects(a, b) {
       return !(a.maxX < b.minX || a.minX > b.maxX || a.maxY < b.minY || a.minY > b.maxY);
     }
@@ -741,8 +775,7 @@ async function main() {
       tooltip.innerHTML =
         '<div class="title">' + escapeHtml(node.fullLabel) + '</div>' +
         '<div class="meta-line">step: ' + node.stepIndex + '</div>' +
-        '<div class="meta-line">baseline sessions: ' + node.baselineCount + '</div>' +
-        '<div class="meta-line">hostname sessions: ' + node.hostnameCount + '</div>' +
+        sensorCountHtml(node.sensorCounts, 'sessions') +
         '<div class="meta-line">total sessions: ' + node.totalCount + '</div>' +
         extra;
       const rect = viewport.getBoundingClientRect();
@@ -775,7 +808,7 @@ async function main() {
         ).join('');
         return (
         '<article class="flow-item">' +
-          '<div class="counts">#' + (index + 1) + ' | total ' + flow.total_count + ' | baseline ' + flow.baseline_count + ' | hostname ' + flow.hostname_count + '</div>' +
+          '<div class="counts">#' + (index + 1) + ' | total ' + flow.total_count + ' | ' + escapeHtml(sensorCountSummary(flow.sensor_counts)) + '</div>' +
           '<div class="flow-steps">' + stepsHtml + '</div>' +
           (sessionLinks ? '<div class="flow-actions">' + sessionLinks + '</div>' : '') +
         '</article>'
@@ -790,8 +823,7 @@ async function main() {
         '<section class="selection-card">' +
           '<h3>' + escapeHtml(node.fullLabel) + '</h3>' +
           '<div class="meta-line">step ' + node.stepIndex + '</div>' +
-          '<div class="meta-line">baseline sessions: ' + node.baselineCount + '</div>' +
-          '<div class="meta-line">hostname sessions: ' + node.hostnameCount + '</div>' +
+          sensorCountHtml(node.sensorCounts, 'sessions') +
           '<div class="meta-line">total sessions: ' + node.totalCount + '</div>' +
           familyLine +
           nodeActions +

@@ -171,6 +171,26 @@ def splunk_escape(value: str) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
+def sensor_count_column(sensor: str) -> str:
+    return f"{sensor}_count"
+
+
+def sensor_session_column(sensor: str) -> str:
+    return f"{sensor}_sessions"
+
+
+def sensor_first_command_column(sensor: str) -> str:
+    return f"{sensor}_first_command"
+
+
+def sensor_command_family_column(sensor: str) -> str:
+    return f"{sensor}_command_family"
+
+
+def build_sensor_counts(record: dict[str, Any], sensors: list[str], suffix: str = "_count") -> dict[str, int]:
+    return {sensor: int(record.get(f"{sensor}{suffix}", 0) or 0) for sensor in sensors}
+
+
 def iter_log_files(sensor_dir: Path) -> Iterable[Path]:
     log_dir = sensor_dir / "log"
     if not log_dir.exists():
@@ -327,7 +347,7 @@ def build_stage_counts(session_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_fingerprinting_candidates(session_df: pd.DataFrame) -> pd.DataFrame:
+def build_fingerprinting_candidates(session_df: pd.DataFrame, sensors: list[str]) -> pd.DataFrame:
     seen_both = session_df.groupby("actor_key")["sensor"].nunique()
     compare = session_df[session_df["actor_key"].isin(seen_both[seen_both > 1].index)].copy()
     if compare.empty:
@@ -335,26 +355,35 @@ def build_fingerprinting_candidates(session_df: pd.DataFrame) -> pd.DataFrame:
 
     rows = []
     for actor_key, group in compare.groupby("actor_key"):
-        rows.append(
-            {
-                "actor_key": actor_key,
-                "src_ip": group["src_ip"].dropna().iloc[0] if not group["src_ip"].dropna().empty else None,
-                "hassh": group["hassh"].dropna().iloc[0] if not group["hassh"].dropna().empty else None,
-                "client_version": group["client_version"].dropna().iloc[0] if not group["client_version"].dropna().empty else None,
-                "baseline_first_command": next((value for value in group.loc[group["sensor"] == "baseline", "first_command"].tolist() if isinstance(value, str)), None),
-                "hostname_first_command": next((value for value in group.loc[group["sensor"] == "hostname", "first_command"].tolist() if isinstance(value, str)), None),
-                "baseline_command_family": next((value for value in group.loc[group["sensor"] == "baseline", "command_family"].tolist() if isinstance(value, str)), None),
-                "hostname_command_family": next((value for value in group.loc[group["sensor"] == "hostname", "command_family"].tolist() if isinstance(value, str)), None),
-                "baseline_sessions": int((group["sensor"] == "baseline").sum()),
-                "hostname_sessions": int((group["sensor"] == "hostname").sum()),
-            }
-        )
+        row = {
+            "actor_key": actor_key,
+            "src_ip": group["src_ip"].dropna().iloc[0] if not group["src_ip"].dropna().empty else None,
+            "hassh": group["hassh"].dropna().iloc[0] if not group["hassh"].dropna().empty else None,
+            "client_version": group["client_version"].dropna().iloc[0] if not group["client_version"].dropna().empty else None,
+            "sensors_seen": ",".join(sorted(group["sensor"].unique())),
+            "sessions_total": int(len(group)),
+        }
+        first_commands: set[str] = set()
+        command_families: set[str] = set()
+        for sensor in sensors:
+            first_command = next((value for value in group.loc[group["sensor"] == sensor, "first_command"].tolist() if isinstance(value, str)), None)
+            command_family = next((value for value in group.loc[group["sensor"] == sensor, "command_family"].tolist() if isinstance(value, str)), None)
+            row[sensor_first_command_column(sensor)] = first_command
+            row[sensor_command_family_column(sensor)] = command_family
+            row[sensor_session_column(sensor)] = int((group["sensor"] == sensor).sum())
+            if first_command:
+                first_commands.add(first_command)
+            if command_family:
+                command_families.add(command_family)
+        row["unique_first_commands"] = len(first_commands)
+        row["unique_command_families"] = len(command_families)
+        rows.append(row)
     result = pd.DataFrame(rows)
-    result["first_command_differs"] = result["baseline_first_command"] != result["hostname_first_command"]
-    result["command_family_differs"] = result["baseline_command_family"] != result["hostname_command_family"]
+    result["first_command_differs"] = result["unique_first_commands"] > 1
+    result["command_family_differs"] = result["unique_command_families"] > 1
     return result.sort_values(
-        ["command_family_differs", "first_command_differs", "baseline_sessions", "hostname_sessions"],
-        ascending=[False, False, False, False],
+        ["command_family_differs", "first_command_differs", "sessions_total"],
+        ascending=[False, False, False],
     )
 
 
@@ -545,23 +574,21 @@ def build_session_paths(
                     "node_type": node["node_type"],
                     "command_family": node["command_family"],
                     "source_eventid": node["source_eventid"],
-                    "baseline_count": 0,
-                    "hostname_count": 0,
+                    **{sensor_count_column(sensor): 0 for sensor in sensors},
                 }
-            node_counter[node_key][f"{sensor}_count"] += 1
+            node_counter[node_key][sensor_count_column(sensor)] += 1
             flow_detail = node_flow_details[node_id].get(full_path)
             if flow_detail is None:
                 flow_detail = {
                     "path": full_path,
                     "sensor": sensor,
                     "steps": flow_steps,
-                    "baseline_count": 0,
-                    "hostname_count": 0,
+                    "sensor_counts": {sensor_name: 0 for sensor_name in sensors},
                     "total_count": 0,
                     "sample_sessions": [],
                 }
                 node_flow_details[node_id][full_path] = flow_detail
-            flow_detail[f"{sensor}_count"] += 1
+            flow_detail["sensor_counts"][sensor] += 1
             flow_detail["total_count"] += 1
             if len(flow_detail["sample_sessions"]) < max_flow_sessions:
                 flow_detail["sample_sessions"].append({"sensor": sensor, "session": session})
@@ -579,13 +606,17 @@ def build_session_paths(
                     "target_step_index": target_node["step_index"],
                     "source_label": source_node["label"],
                     "target_label": target_node["label"],
-                    "baseline_count": 0,
-                    "hostname_count": 0,
+                    **{sensor_count_column(sensor): 0 for sensor in sensors},
                 }
-            edge_counter[edge_key][f"{sensor}_count"] += 1
+            edge_counter[edge_key][sensor_count_column(sensor)] += 1
 
     nodes_df = pd.DataFrame(node_counter.values())
-    nodes_df["total_count"] = nodes_df["baseline_count"] + nodes_df["hostname_count"]
+    count_columns = [sensor_count_column(sensor) for sensor in sensors]
+    nodes_df["total_count"] = nodes_df[count_columns].sum(axis=1)
+    nodes_df["sensor_counts"] = nodes_df.apply(
+        lambda row: {sensor: int(row[sensor_count_column(sensor)]) for sensor in sensors},
+        axis=1,
+    )
     nodes_df["color_key"] = nodes_df.apply(
         lambda row: row["command_family"] if row["node_type"] == "command" else ("terminal" if row["node_type"] == "terminal" else row["node_type"]),
         axis=1,
@@ -594,18 +625,27 @@ def build_session_paths(
     for node_id in nodes_df["node_id"]:
         ranked = sorted(
             node_flow_details.get(node_id, {}).values(),
-            key=lambda item: (-item["total_count"], -item["baseline_count"], -item["hostname_count"], item["path"]),
+            key=lambda item: (
+                -item["total_count"],
+                *[-int(item["sensor_counts"].get(sensor, 0)) for sensor in sensors],
+                item["path"],
+            ),
         )
         top_flow_records.append(ranked[:max_node_flows])
     nodes_df["top_flows"] = top_flow_records
 
     edges_df = pd.DataFrame(edge_counter.values())
-    edges_df["total_count"] = edges_df["baseline_count"] + edges_df["hostname_count"]
-    edges_df["sensor_mix"] = edges_df.apply(
-        lambda row: "both"
-        if row["baseline_count"] > 0 and row["hostname_count"] > 0
-        else ("baseline_only" if row["baseline_count"] > 0 else "hostname_only"),
+    edges_df["total_count"] = edges_df[count_columns].sum(axis=1)
+    edges_df["sensor_counts"] = edges_df.apply(
+        lambda row: {sensor: int(row[sensor_count_column(sensor)]) for sensor in sensors},
         axis=1,
+    )
+    edges_df["sensor_mix"] = edges_df["sensor_counts"].map(
+        lambda counts: (
+            active[0]
+            if len(active := [sensor for sensor, count in counts.items() if count > 0]) == 1
+            else ("multiple" if active else "none")
+        )
     )
     edges_df = edges_df.sort_values(["source_step_index", "total_count"], ascending=[True, False]).reset_index(drop=True)
     nodes_df = compute_model_order(nodes_df, edges_df)
@@ -653,6 +693,7 @@ def build_summary_markdown(
     fingerprinting_candidates: pd.DataFrame,
     top_tables: dict[str, pd.DataFrame],
     top_paths_df: pd.DataFrame,
+    sensors: list[str],
     max_summary_paths: int,
     max_summary_rows: int,
 ) -> str:
@@ -697,19 +738,25 @@ def build_summary_markdown(
         lines.append("- No actors were observed on both sensors within the selected window.")
     else:
         for _, row in fingerprinting_candidates.head(15).iterrows():
+            sensor_details = " ".join(
+                f"{sensor}=`{row.get(sensor_command_family_column(sensor))}`"
+                for sensor in sensors
+                if pd.notna(row.get(sensor_command_family_column(sensor)))
+            )
             lines.append(
                 f"- `{row['src_ip']}` `{row['hassh'] or row['client_version']}`: "
-                f"baseline=`{row['baseline_command_family']}` hostname=`{row['hostname_command_family']}` "
+                f"{sensor_details} "
                 f"first_command_differs={row['first_command_differs']}"
             )
 
     lines.extend(["", "## Likely Differentiators"])
-    hostname_recon = session_df.loc[(session_df["sensor"] == "hostname") & (session_df["fingerprinting_session"])]
-    baseline_recon = session_df.loc[(session_df["sensor"] == "baseline") & (session_df["fingerprinting_session"])]
-    lines.append(
-        f"- Recon activity rate is {format_pct(hostname_recon.shape[0] / max(1, session_df.loc[session_df['sensor'] == 'hostname'].shape[0]))} on `hostname` "
-        f"vs {format_pct(baseline_recon.shape[0] / max(1, session_df.loc[session_df['sensor'] == 'baseline'].shape[0]))} on `baseline`."
-    )
+    recon_rates = []
+    for sensor in sensors:
+        sensor_sessions = session_df.loc[session_df["sensor"] == sensor]
+        recon_rate = sensor_sessions["fingerprinting_session"].mean() if not sensor_sessions.empty else 0.0
+        recon_rates.append((sensor, recon_rate))
+    for sensor, recon_rate in sorted(recon_rates, key=lambda item: item[1], reverse=True):
+        lines.append(f"- `{sensor}` recon activity rate: {format_pct(recon_rate)}.")
     lines.append("- The ELK renderer consumes `cowrie_state_machine_graph.json` directly, so layout iteration no longer requires raw-log reanalysis.")
     return "\n".join(lines) + "\n"
 
@@ -734,7 +781,7 @@ def parse_args() -> argparse.Namespace:
 
     analyze = subparsers.add_parser("analyze", help="Parse raw Cowrie logs and build analysis artifacts.")
     analyze.add_argument("--input-root", default="honeypot/outputs")
-    analyze.add_argument("--sensors", default="baseline,hostname")
+    analyze.add_argument("--sensors", default="baseline,hostname,banner")
     analyze.add_argument("--from", dest="from_date", default=None)
     analyze.add_argument("--to", dest="to_date", default=None)
     analyze.add_argument("--max-summary-paths", type=int, default=8)
@@ -762,7 +809,7 @@ def run_analyze(args: argparse.Namespace) -> None:
 
     session_df = build_session_table(events)
     stage_counts = build_stage_counts(session_df)
-    fingerprinting_candidates = build_fingerprinting_candidates(session_df)
+    fingerprinting_candidates = build_fingerprinting_candidates(session_df, sensors)
     top_tables = build_top_tables(events, session_df)
     state_nodes, state_edges, session_paths, top_paths_df = build_session_paths(events, sensors)
     graph_json = build_graph_json(state_nodes, state_edges, session_df, sensors, args.from_date, args.to_date)
@@ -785,6 +832,7 @@ def run_analyze(args: argparse.Namespace) -> None:
         fingerprinting_candidates=fingerprinting_candidates,
         top_tables=top_tables,
         top_paths_df=top_paths_df,
+        sensors=sensors,
         max_summary_paths=args.max_summary_paths,
         max_summary_rows=args.max_summary_rows,
     )

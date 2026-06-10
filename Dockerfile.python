@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY analyze_cowrie.py ./
 
-CMD ["python", "honeypot/analysis/analyze_cowrie.py", "analyze", "--input-root", "honeypot/outputs", "--artifact-dir", "honeypot/analysis/artifacts", "--sensors", "baseline,hostname"]
+CMD ["python", "honeypot/analysis/analyze_cowrie.py", "analyze", "--input-root", "honeypot/outputs", "--artifact-dir", "honeypot/analysis/artifacts", "--sensors", "baseline,hostname,banner"]

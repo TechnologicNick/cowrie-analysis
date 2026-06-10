@@ -18,7 +18,7 @@ bun install
 python honeypot/analysis/analyze_cowrie.py analyze `
   --input-root honeypot/outputs `
   --artifact-dir honeypot/analysis/artifacts `
-  --sensors baseline,hostname
+  --sensors baseline,hostname,banner
 ```
 
 3. Render the visualization from the previously generated graph JSON:
@@ -38,7 +38,7 @@ bun run honeypot/analysis/serve_artifacts.ts --dir honeypot/analysis/artifacts -
 
 5. Open `http://localhost:3000/`.
 
-- Hover a node to see baseline, hostname, and total session counts.
+- Hover a node to see per-sensor and total session counts.
 - Click a node to populate the right-hand sidebar with the top full flows through that node.
 - Sidebar flow entries render one state per line, reuse the node colors, and include sample session links into Splunk.
 - The selected node card also includes a direct Splunk search link for that node.

@@ -49,7 +49,7 @@ services:
       - --artifact-dir
       - honeypot/analysis/artifacts
       - --sensors
-      - baseline,hostname
+      - baseline,hostname,banner
     volumes:
       - ../..:/workspace
     profiles:
