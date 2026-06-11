@@ -6,7 +6,7 @@ import json
 import subprocess
 import sys
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -134,6 +134,23 @@ class SessionSummary:
     close_stage: str
     actor_key: str
     fingerprinting_session: bool
+
+
+@dataclass
+class SessionAggregate:
+    sensor: str
+    session: str
+    src_ip: str | None = None
+    dst_ip: str | None = None
+    start_ns: int | None = None
+    end_ns: int | None = None
+    eventids: set[str] = field(default_factory=set)
+    path_events: list[tuple[int, str, str | None]] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    command_family_counts: Counter[str] = field(default_factory=Counter)
+    hassh: str | None = None
+    client_version: str | None = None
+    duration_s: float | None = None
 
 
 def normalize_command(command: str) -> str:
@@ -278,6 +295,384 @@ def summarize_commands(session_events: pd.DataFrame) -> tuple[int, str, str | No
         commands[0],
         any(family == "fingerprinting/recon" for family in families),
     )
+
+
+def _ns_to_iso(timestamp_ns: int | None) -> str | None:
+    if timestamp_ns is None:
+        return None
+    return pd.Timestamp(timestamp_ns, tz="UTC").isoformat()
+
+
+def _build_counter_table(
+    counter: Counter[tuple[str, str]],
+    value_column: str,
+) -> pd.DataFrame:
+    if not counter:
+        return pd.DataFrame(columns=["sensor", value_column, "count"])
+    rows = [
+        {"sensor": sensor, value_column: value, "count": count}
+        for (sensor, value), count in counter.items()
+    ]
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["sensor", "count", value_column], ascending=[True, False, True])
+        .reset_index(drop=True)
+    )
+
+
+def analyze_logs_streaming(
+    input_root: Path,
+    sensors: list[str],
+    from_date: str | None,
+    to_date: str | None,
+    max_node_flows: int = 12,
+    max_flow_sessions: int = 3,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, int]:
+    from_ts = pd.Timestamp(from_date).tz_localize("UTC") if from_date else None
+    to_ts = pd.Timestamp(to_date).tz_localize("UTC") + pd.Timedelta(days=1) if to_date else None
+    log_files = [
+        (sensor, log_file)
+        for sensor in sensors
+        for log_file in iter_log_files(input_root / sensor)
+    ]
+    total_bytes = sum(log_file.stat().st_size for _, log_file in log_files)
+
+    sessions: dict[str, SessionAggregate] = {}
+    top_hassh_counter: Counter[tuple[str, str]] = Counter()
+    top_versions_counter: Counter[tuple[str, str]] = Counter()
+    top_commands_counter: Counter[tuple[str, str]] = Counter()
+    total_events = 0
+
+    progress = tqdm(total=total_bytes, unit="B", unit_scale=True, desc="Loading Cowrie logs")
+    for sensor, log_file in log_files:
+        progress.set_postfix_str(f"{sensor}/{log_file.name}")
+        with log_file.open("rb") as handle:
+            for raw_line in handle:
+                progress.update(len(raw_line))
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                timestamp = pd.to_datetime(event.get("timestamp"), utc=True, errors="coerce")
+                if pd.isna(timestamp):
+                    continue
+                if from_ts is not None and timestamp < from_ts:
+                    continue
+                if to_ts is not None and timestamp >= to_ts:
+                    continue
+
+                total_events += 1
+                session = str(event.get("session", ""))
+                session_key = f"{sensor}:{session}"
+                aggregate = sessions.get(session_key)
+                if aggregate is None:
+                    aggregate = SessionAggregate(sensor=sensor, session=session)
+                    sessions[session_key] = aggregate
+
+                timestamp_ns = int(timestamp.value)
+                aggregate.start_ns = timestamp_ns if aggregate.start_ns is None else min(aggregate.start_ns, timestamp_ns)
+                aggregate.end_ns = timestamp_ns if aggregate.end_ns is None else max(aggregate.end_ns, timestamp_ns)
+                if aggregate.src_ip is None:
+                    aggregate.src_ip = event.get("src_ip")
+                if aggregate.dst_ip is None:
+                    aggregate.dst_ip = event.get("dst_ip")
+
+                eventid = str(event.get("eventid", ""))
+                aggregate.eventids.add(eventid)
+
+                payload: str | None = None
+                if eventid == "cowrie.command.input":
+                    input_value = event.get("input")
+                    if isinstance(input_value, str):
+                        payload = normalize_command(input_value)
+                        aggregate.commands.append(payload)
+                        aggregate.command_family_counts[classify_command(payload)] += 1
+                        top_commands_counter[(sensor, payload)] += 1
+                elif eventid == "cowrie.client.kex":
+                    hassh_value = event.get("hassh")
+                    if isinstance(hassh_value, str):
+                        if aggregate.hassh is None:
+                            aggregate.hassh = hassh_value
+                        top_hassh_counter[(sensor, hassh_value)] += 1
+                elif eventid == "cowrie.client.version":
+                    version_value = event.get("version")
+                    if isinstance(version_value, str):
+                        if aggregate.client_version is None:
+                            aggregate.client_version = version_value
+                        top_versions_counter[(sensor, version_value)] += 1
+                elif eventid == "cowrie.session.closed":
+                    duration_value = event.get("duration")
+                    try:
+                        aggregate.duration_s = float(duration_value)
+                    except (TypeError, ValueError):
+                        pass
+
+                aggregate.path_events.append((timestamp_ns, eventid, payload))
+    progress.close()
+
+    if not sessions:
+        return (
+            pd.DataFrame(),
+            {
+                "top_hassh": _build_counter_table(Counter(), "hassh"),
+                "top_versions": _build_counter_table(Counter(), "version"),
+                "top_commands": _build_counter_table(Counter(), "input"),
+                "top_command_families": pd.DataFrame(columns=["sensor", "command_family", "count"]),
+            },
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            total_events,
+        )
+
+    session_records: list[SessionSummary] = []
+    node_counter: dict[tuple[int, str, str], dict[str, Any]] = {}
+    edge_counter: dict[tuple[tuple[int, str, str], tuple[int, str, str]], dict[str, Any]] = {}
+    path_prefix_counter: dict[str, Counter[tuple[str, ...]]] = {sensor: Counter() for sensor in sensors}
+    node_flow_details: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    session_path_rows: list[dict[str, Any]] = []
+    count_columns = [sensor_count_column(sensor) for sensor in sensors]
+
+    for aggregate in tqdm(sessions.values(), total=len(sessions), unit="session", desc="Building session artifacts"):
+        commands_run = len(aggregate.commands)
+        command_family = (
+            aggregate.command_family_counts.most_common(1)[0][0]
+            if aggregate.command_family_counts
+            else "no_command"
+        )
+        first_command = aggregate.commands[0] if aggregate.commands else None
+        fingerprinting_session = aggregate.command_family_counts.get("fingerprinting/recon", 0) > 0
+        session_closed = "cowrie.session.closed" in aggregate.eventids
+        actor_key = f"{aggregate.src_ip or 'unknown'}|{aggregate.hassh or aggregate.client_version or 'no-version'}"
+
+        session_records.append(
+            SessionSummary(
+                sensor=aggregate.sensor,
+                session=aggregate.session,
+                src_ip=aggregate.src_ip,
+                dst_ip=aggregate.dst_ip,
+                start_time=_ns_to_iso(aggregate.start_ns),
+                end_time=_ns_to_iso(aggregate.end_ns),
+                duration_s=aggregate.duration_s,
+                version_seen="cowrie.client.version" in aggregate.eventids,
+                client_version=aggregate.client_version,
+                kex_seen="cowrie.client.kex" in aggregate.eventids,
+                hassh=aggregate.hassh,
+                auth_success="cowrie.login.success" in aggregate.eventids,
+                auth_failed="cowrie.login.failed" in aggregate.eventids,
+                shell_opened="cowrie.session.params" in aggregate.eventids,
+                commands_run=commands_run,
+                command_family=command_family,
+                first_command=first_command,
+                tunnel_activity=any(eventid in aggregate.eventids for eventid in ["cowrie.direct-tcpip.request", "cowrie.direct-tcpip.data", "cowrie.direct-tcpip.ja4", "cowrie.direct-tcpip.ja4h"]),
+                file_transfer=any(eventid in aggregate.eventids for eventid in ["cowrie.session.file_download", "cowrie.session.file_upload"]),
+                tty_closed="cowrie.log.closed" in aggregate.eventids,
+                session_closed=session_closed,
+                close_stage=derive_close_stage(aggregate.eventids, session_closed),
+                actor_key=actor_key,
+                fingerprinting_session=fingerprinting_session,
+            )
+        )
+
+        path_nodes: list[dict[str, Any]] = [
+            {
+                "step_index": 0,
+                "label": aggregate.sensor,
+                "node_type": "root",
+                "command_family": "",
+                "display_label": f"root: {aggregate.sensor}",
+                "full_display_label": f"root: {aggregate.sensor}",
+                "source_eventid": "",
+            }
+        ]
+        prefix_labels = [aggregate.sensor]
+
+        for step_index, (_, eventid, payload) in enumerate(
+            sorted(aggregate.path_events, key=lambda item: (item[0], item[1])),
+            start=1,
+        ):
+            if eventid == "cowrie.command.input":
+                label = payload or ""
+                node_type = "command"
+                command_family_value = classify_command(label)
+                source_eventid = "cowrie.command.input"
+            else:
+                label = event_display_name(eventid)
+                node_type = "terminal" if eventid == "cowrie.session.closed" else "event"
+                command_family_value = ""
+                source_eventid = eventid
+
+            prefix = node_label_prefix(node_type)
+            path_nodes.append(
+                {
+                    "step_index": step_index,
+                    "label": label,
+                    "node_type": node_type,
+                    "command_family": command_family_value,
+                    "display_label": f"{prefix}: {display_label(label)}",
+                    "full_display_label": f"{prefix}: {label}",
+                    "source_eventid": source_eventid,
+                }
+            )
+            prefix_labels.append(label)
+
+        if path_nodes[-1]["label"] != "session.closed":
+            path_nodes.append(
+                {
+                    "step_index": len(path_nodes),
+                    "label": "still_open",
+                    "node_type": "terminal",
+                    "command_family": "",
+                    "display_label": "end: still_open",
+                    "full_display_label": "end: still_open",
+                    "source_eventid": "",
+                }
+            )
+            prefix_labels.append("still_open")
+
+        full_path_labels = [node["full_display_label"] for node in path_nodes]
+        full_path = " -> ".join(full_path_labels)
+        flow_steps = [
+            {
+                "label": node["label"],
+                "display_label": node["full_display_label"],
+                "node_type": node["node_type"],
+                "command_family": node["command_family"],
+                "color_key": (
+                    node["command_family"]
+                    if node["node_type"] == "command"
+                    else ("terminal" if node["node_type"] == "terminal" else node["node_type"])
+                ),
+            }
+            for node in path_nodes
+        ]
+
+        path_prefix_counter[aggregate.sensor][tuple(prefix_labels[:8])] += 1
+        session_path_rows.append(
+            {
+                "sensor": aggregate.sensor,
+                "session": aggregate.session,
+                "path_length": len(path_nodes) - 1,
+                "full_path": full_path,
+                "path_preview": " -> ".join(prefix_labels[:12]),
+            }
+        )
+
+        for node in path_nodes:
+            node_key = (node["step_index"], node["label"], node["node_type"])
+            node_id = f"{node['step_index']}|{node['node_type']}|{node['label']}"
+            if node_key not in node_counter:
+                node_counter[node_key] = {
+                    "node_id": node_id,
+                    "step_index": node["step_index"],
+                    "label": node["label"],
+                    "display_label": node["display_label"],
+                    "full_display_label": node["full_display_label"],
+                    "node_type": node["node_type"],
+                    "command_family": node["command_family"],
+                    "source_eventid": node["source_eventid"],
+                    **{sensor_count_column(sensor_name): 0 for sensor_name in sensors},
+                }
+            node_counter[node_key][sensor_count_column(aggregate.sensor)] += 1
+            flow_detail = node_flow_details[node_id].get(full_path)
+            if flow_detail is None:
+                flow_detail = {
+                    "path": full_path,
+                    "sensor": aggregate.sensor,
+                    "steps": flow_steps,
+                    "sensor_counts": {sensor_name: 0 for sensor_name in sensors},
+                    "total_count": 0,
+                    "sample_sessions": [],
+                }
+                node_flow_details[node_id][full_path] = flow_detail
+            flow_detail["sensor_counts"][aggregate.sensor] += 1
+            flow_detail["total_count"] += 1
+            if len(flow_detail["sample_sessions"]) < max_flow_sessions:
+                flow_detail["sample_sessions"].append({"sensor": aggregate.sensor, "session": aggregate.session})
+
+        for source_node, target_node in zip(path_nodes, path_nodes[1:]):
+            edge_key = (
+                (source_node["step_index"], source_node["label"], source_node["node_type"]),
+                (target_node["step_index"], target_node["label"], target_node["node_type"]),
+            )
+            if edge_key not in edge_counter:
+                edge_counter[edge_key] = {
+                    "source_id": f"{source_node['step_index']}|{source_node['node_type']}|{source_node['label']}",
+                    "target_id": f"{target_node['step_index']}|{target_node['node_type']}|{target_node['label']}",
+                    "source_step_index": source_node["step_index"],
+                    "target_step_index": target_node["step_index"],
+                    "source_label": source_node["label"],
+                    "target_label": target_node["label"],
+                    **{sensor_count_column(sensor_name): 0 for sensor_name in sensors},
+                }
+            edge_counter[edge_key][sensor_count_column(aggregate.sensor)] += 1
+
+    session_df = pd.DataFrame(asdict(record) for record in session_records)
+
+    nodes_df = pd.DataFrame(node_counter.values())
+    nodes_df["total_count"] = nodes_df[count_columns].sum(axis=1)
+    nodes_df["sensor_counts"] = nodes_df.apply(
+        lambda row: {sensor: int(row[sensor_count_column(sensor)]) for sensor in sensors},
+        axis=1,
+    )
+    nodes_df["color_key"] = nodes_df.apply(
+        lambda row: row["command_family"] if row["node_type"] == "command" else ("terminal" if row["node_type"] == "terminal" else row["node_type"]),
+        axis=1,
+    )
+    nodes_df["top_flows"] = [
+        sorted(
+            node_flow_details.get(node_id, {}).values(),
+            key=lambda item: (
+                -item["total_count"],
+                *[-int(item["sensor_counts"].get(sensor, 0)) for sensor in sensors],
+                item["path"],
+            ),
+        )[:max_node_flows]
+        for node_id in nodes_df["node_id"]
+    ]
+
+    edges_df = pd.DataFrame(edge_counter.values())
+    edges_df["total_count"] = edges_df[count_columns].sum(axis=1)
+    edges_df["sensor_counts"] = edges_df.apply(
+        lambda row: {sensor: int(row[sensor_count_column(sensor)]) for sensor in sensors},
+        axis=1,
+    )
+    edges_df["sensor_mix"] = edges_df["sensor_counts"].map(
+        lambda counts: (
+            active[0]
+            if len(active := [sensor for sensor, count in counts.items() if count > 0]) == 1
+            else ("multiple" if active else "none")
+        )
+    )
+    edges_df = edges_df.sort_values(["source_step_index", "total_count"], ascending=[True, False]).reset_index(drop=True)
+    nodes_df = compute_model_order(nodes_df, edges_df)
+
+    top_paths_df = pd.DataFrame(
+        [
+            {"sensor": sensor, "path_prefix": " -> ".join(prefix), "count": count}
+            for sensor, counter in path_prefix_counter.items()
+            for prefix, count in counter.most_common()
+        ]
+    )
+    session_paths_df = pd.DataFrame(session_path_rows)
+    top_tables = {
+        "top_hassh": _build_counter_table(top_hassh_counter, "hassh"),
+        "top_versions": _build_counter_table(top_versions_counter, "version"),
+        "top_commands": _build_counter_table(top_commands_counter, "input"),
+        "top_command_families": (
+            session_df.loc[session_df["commands_run"] > 0, ["sensor", "command_family"]]
+            .value_counts()
+            .rename("count")
+            .reset_index()
+            .sort_values(["sensor", "count"], ascending=[True, False])
+        ),
+    }
+    return session_df, top_tables, nodes_df, edges_df, session_paths_df, top_paths_df, total_events
 
 
 def _clean_optional(value: Any) -> Any:
@@ -1067,15 +1462,17 @@ def run_analyze(args: argparse.Namespace) -> None:
     artifact_dir = Path(args.artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     sensors = [sensor.strip() for sensor in args.sensors.split(",") if sensor.strip()]
-
-    events = load_events(input_root, sensors, args.from_date, args.to_date)
-    if events.empty:
+    print("Starting Cowrie analysis...")
+    session_df, top_tables, state_nodes, state_edges, session_paths, top_paths_df, total_events = analyze_logs_streaming(
+        input_root=input_root,
+        sensors=sensors,
+        from_date=args.from_date,
+        to_date=args.to_date,
+    )
+    if session_df.empty:
         raise SystemExit("No events found for the selected sensors/date range.")
-
-    session_df, state_nodes, state_edges, session_paths, top_paths_df = build_session_artifacts(events, sensors)
     stage_counts = build_stage_counts(session_df)
     fingerprinting_candidates = build_fingerprinting_candidates(session_df, sensors)
-    top_tables = build_top_tables(events, session_df)
     graph_json = build_graph_json(state_nodes, state_edges, session_df, sensors, args.from_date, args.to_date)
 
     write_dataframe(session_df, artifact_dir / "cowrie_sessions.parquet")
@@ -1102,10 +1499,11 @@ def run_analyze(args: argparse.Namespace) -> None:
     )
     (artifact_dir / "cowrie_summary.md").write_text(summary, encoding="utf-8")
 
-    print(f"Analyzed {len(events)} events across {len(session_df)} sessions.")
+    print(f"Analyzed {total_events} events across {len(session_df)} sessions.")
     print(f"State nodes: {len(state_nodes)}")
     print(f"State edges: {len(state_edges)}")
     print(f"Artifacts written to {artifact_dir}")
+    print("Cowrie analysis done.")
 
 
 def run_render(args: argparse.Namespace) -> None:
