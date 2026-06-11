@@ -13,6 +13,7 @@ import re
 from typing import Any, Iterable
 
 import pandas as pd
+from tqdm import tqdm
 
 
 FINGERPRINT_PATTERNS: list[tuple[str, list[re.Pattern[str]]]] = [
@@ -202,32 +203,42 @@ def load_events(input_root: Path, sensors: list[str], from_date: str | None, to_
     rows: list[dict[str, Any]] = []
     from_ts = pd.Timestamp(from_date).tz_localize("UTC") if from_date else None
     to_ts = pd.Timestamp(to_date).tz_localize("UTC") + pd.Timedelta(days=1) if to_date else None
+    log_files = [
+        (sensor, log_file)
+        for sensor in sensors
+        for log_file in iter_log_files(input_root / sensor)
+    ]
+    total_bytes = sum(log_file.stat().st_size for _, log_file in log_files)
+    progress = tqdm(total=total_bytes, unit="B", unit_scale=True, desc="Loading Cowrie logs")
 
-    for sensor in sensors:
-        sensor_dir = input_root / sensor
-        for log_file in iter_log_files(sensor_dir):
-            with log_file.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
+    for sensor, log_file in log_files:
+        progress.set_postfix_str(f"{sensor}/{log_file.name}")
+        with log_file.open("rb") as handle:
+            for raw_line in handle:
+                progress.update(len(raw_line))
+                line = raw_line.strip()
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8", errors="ignore")
                     if not line:
                         continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-                    timestamp = pd.to_datetime(event.get("timestamp"), utc=True, errors="coerce")
-                    if pd.isna(timestamp):
-                        continue
-                    if from_ts is not None and timestamp < from_ts:
-                        continue
-                    if to_ts is not None and timestamp >= to_ts:
-                        continue
+                timestamp = pd.to_datetime(event.get("timestamp"), utc=True, errors="coerce")
+                if pd.isna(timestamp):
+                    continue
+                if from_ts is not None and timestamp < from_ts:
+                    continue
+                if to_ts is not None and timestamp >= to_ts:
+                    continue
 
-                    event["timestamp"] = timestamp
-                    event["sensor"] = sensor
-                    event["session_key"] = f"{sensor}:{event.get('session', '')}"
-                    rows.append(event)
+                event["timestamp"] = timestamp
+                event["sensor"] = sensor
+                event["session_key"] = f"{sensor}:{event.get('session', '')}"
+                rows.append(event)
+    progress.close()
 
     frame = pd.DataFrame(rows)
     if frame.empty:
@@ -267,6 +278,260 @@ def summarize_commands(session_events: pd.DataFrame) -> tuple[int, str, str | No
         commands[0],
         any(family == "fingerprinting/recon" for family in families),
     )
+
+
+def _clean_optional(value: Any) -> Any:
+    return None if pd.isna(value) else value
+
+
+def build_session_artifacts(
+    events: pd.DataFrame,
+    sensors: list[str],
+    max_node_flows: int = 12,
+    max_flow_sessions: int = 3,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    session_records: list[SessionSummary] = []
+    node_counter: dict[tuple[int, str, str], dict[str, Any]] = {}
+    edge_counter: dict[tuple[tuple[int, str, str], tuple[int, str, str]], dict[str, Any]] = {}
+    path_prefix_counter: dict[str, Counter[tuple[str, ...]]] = {sensor: Counter() for sensor in sensors}
+    node_flow_details: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    session_path_rows: list[dict[str, Any]] = []
+    count_columns = [sensor_count_column(sensor) for sensor in sensors]
+
+    session_groups = events.groupby(["sensor", "session"], sort=False)
+    total_sessions = int(events["session_key"].nunique())
+    for (sensor, session), session_events in tqdm(
+        session_groups,
+        total=total_sessions,
+        unit="session",
+        desc="Building session artifacts",
+    ):
+        eventids = set(session_events["eventid"].tolist())
+        first = session_events.iloc[0]
+        last = session_events.iloc[-1]
+        commands_run, command_family, first_command, fingerprinting_session = summarize_commands(session_events)
+        hassh_values = session_events.loc[session_events["eventid"] == "cowrie.client.kex", "hassh"].dropna()
+        version_values = session_events.loc[session_events["eventid"] == "cowrie.client.version", "version"].dropna()
+        hassh = hassh_values.iloc[0] if not hassh_values.empty else None
+        client_version = version_values.iloc[0] if not version_values.empty else None
+        duration_values = session_events.loc[session_events["eventid"] == "cowrie.session.closed", "duration"].dropna()
+        duration_s = None
+        if not duration_values.empty:
+            try:
+                duration_s = float(duration_values.iloc[-1])
+            except (TypeError, ValueError):
+                duration_s = None
+
+        actor_key = f"{_clean_optional(first.get('src_ip')) or 'unknown'}|{hassh or client_version or 'no-version'}"
+        session_closed = "cowrie.session.closed" in eventids
+
+        session_records.append(
+            SessionSummary(
+                sensor=sensor,
+                session=str(session),
+                src_ip=_clean_optional(first.get("src_ip")),
+                dst_ip=_clean_optional(first.get("dst_ip")),
+                start_time=first.get("timestamp").isoformat() if pd.notna(first.get("timestamp")) else None,
+                end_time=last.get("timestamp").isoformat() if pd.notna(last.get("timestamp")) else None,
+                duration_s=duration_s,
+                version_seen="cowrie.client.version" in eventids,
+                client_version=client_version,
+                kex_seen="cowrie.client.kex" in eventids,
+                hassh=hassh,
+                auth_success="cowrie.login.success" in eventids,
+                auth_failed="cowrie.login.failed" in eventids,
+                shell_opened="cowrie.session.params" in eventids,
+                commands_run=commands_run,
+                command_family=command_family,
+                first_command=first_command,
+                tunnel_activity=any(eventid in eventids for eventid in ["cowrie.direct-tcpip.request", "cowrie.direct-tcpip.data", "cowrie.direct-tcpip.ja4", "cowrie.direct-tcpip.ja4h"]),
+                file_transfer=any(eventid in eventids for eventid in ["cowrie.session.file_download", "cowrie.session.file_upload"]),
+                tty_closed="cowrie.log.closed" in eventids,
+                session_closed=session_closed,
+                close_stage=derive_close_stage(eventids, session_closed),
+                actor_key=actor_key,
+                fingerprinting_session=fingerprinting_session,
+            )
+        )
+
+        path_nodes: list[dict[str, Any]] = [
+            {
+                "step_index": 0,
+                "label": sensor,
+                "node_type": "root",
+                "command_family": "",
+                "display_label": f"root: {sensor}",
+                "full_display_label": f"root: {sensor}",
+                "source_eventid": "",
+            }
+        ]
+        prefix_labels = [sensor]
+
+        for step_index, event in enumerate(session_events.itertuples(index=False), start=1):
+            if event.eventid == "cowrie.command.input":
+                label = normalize_command(getattr(event, "input", "") or "")
+                node_type = "command"
+                command_family_value = classify_command(label)
+                source_eventid = "cowrie.command.input"
+            else:
+                label = event_display_name(event.eventid)
+                node_type = "terminal" if event.eventid == "cowrie.session.closed" else "event"
+                command_family_value = ""
+                source_eventid = event.eventid
+
+            prefix = node_label_prefix(node_type)
+            path_nodes.append(
+                {
+                    "step_index": step_index,
+                    "label": label,
+                    "node_type": node_type,
+                    "command_family": command_family_value,
+                    "display_label": f"{prefix}: {display_label(label)}",
+                    "full_display_label": f"{prefix}: {label}",
+                    "source_eventid": source_eventid,
+                }
+            )
+            prefix_labels.append(label)
+
+        if path_nodes[-1]["label"] != "session.closed":
+            path_nodes.append(
+                {
+                    "step_index": len(path_nodes),
+                    "label": "still_open",
+                    "node_type": "terminal",
+                    "command_family": "",
+                    "display_label": "end: still_open",
+                    "full_display_label": "end: still_open",
+                    "source_eventid": "",
+                }
+            )
+            prefix_labels.append("still_open")
+
+        full_path_labels = [node["full_display_label"] for node in path_nodes]
+        full_path = " -> ".join(full_path_labels)
+        flow_steps = [
+            {
+                "label": node["label"],
+                "display_label": node["full_display_label"],
+                "node_type": node["node_type"],
+                "command_family": node["command_family"],
+                "color_key": (
+                    node["command_family"]
+                    if node["node_type"] == "command"
+                    else ("terminal" if node["node_type"] == "terminal" else node["node_type"])
+                ),
+            }
+            for node in path_nodes
+        ]
+
+        path_prefix_counter[sensor][tuple(prefix_labels[:8])] += 1
+        session_path_rows.append(
+            {
+                "sensor": sensor,
+                "session": session,
+                "path_length": len(path_nodes) - 1,
+                "full_path": full_path,
+                "path_preview": " -> ".join(prefix_labels[:12]),
+            }
+        )
+
+        for node in path_nodes:
+            node_key = (node["step_index"], node["label"], node["node_type"])
+            node_id = f"{node['step_index']}|{node['node_type']}|{node['label']}"
+            if node_key not in node_counter:
+                node_counter[node_key] = {
+                    "node_id": node_id,
+                    "step_index": node["step_index"],
+                    "label": node["label"],
+                    "display_label": node["display_label"],
+                    "full_display_label": node["full_display_label"],
+                    "node_type": node["node_type"],
+                    "command_family": node["command_family"],
+                    "source_eventid": node["source_eventid"],
+                    **{sensor_count_column(sensor_name): 0 for sensor_name in sensors},
+                }
+            node_counter[node_key][sensor_count_column(sensor)] += 1
+            flow_detail = node_flow_details[node_id].get(full_path)
+            if flow_detail is None:
+                flow_detail = {
+                    "path": full_path,
+                    "sensor": sensor,
+                    "steps": flow_steps,
+                    "sensor_counts": {sensor_name: 0 for sensor_name in sensors},
+                    "total_count": 0,
+                    "sample_sessions": [],
+                }
+                node_flow_details[node_id][full_path] = flow_detail
+            flow_detail["sensor_counts"][sensor] += 1
+            flow_detail["total_count"] += 1
+            if len(flow_detail["sample_sessions"]) < max_flow_sessions:
+                flow_detail["sample_sessions"].append({"sensor": sensor, "session": session})
+
+        for source_node, target_node in zip(path_nodes, path_nodes[1:]):
+            edge_key = (
+                (source_node["step_index"], source_node["label"], source_node["node_type"]),
+                (target_node["step_index"], target_node["label"], target_node["node_type"]),
+            )
+            if edge_key not in edge_counter:
+                edge_counter[edge_key] = {
+                    "source_id": f"{source_node['step_index']}|{source_node['node_type']}|{source_node['label']}",
+                    "target_id": f"{target_node['step_index']}|{target_node['node_type']}|{target_node['label']}",
+                    "source_step_index": source_node["step_index"],
+                    "target_step_index": target_node["step_index"],
+                    "source_label": source_node["label"],
+                    "target_label": target_node["label"],
+                    **{sensor_count_column(sensor_name): 0 for sensor_name in sensors},
+                }
+            edge_counter[edge_key][sensor_count_column(sensor)] += 1
+
+    session_df = pd.DataFrame(asdict(record) for record in session_records)
+    nodes_df = pd.DataFrame(node_counter.values())
+    nodes_df["total_count"] = nodes_df[count_columns].sum(axis=1)
+    nodes_df["sensor_counts"] = nodes_df.apply(
+        lambda row: {sensor: int(row[sensor_count_column(sensor)]) for sensor in sensors},
+        axis=1,
+    )
+    nodes_df["color_key"] = nodes_df.apply(
+        lambda row: row["command_family"] if row["node_type"] == "command" else ("terminal" if row["node_type"] == "terminal" else row["node_type"]),
+        axis=1,
+    )
+    nodes_df["top_flows"] = [
+        sorted(
+            node_flow_details.get(node_id, {}).values(),
+            key=lambda item: (
+                -item["total_count"],
+                *[-int(item["sensor_counts"].get(sensor, 0)) for sensor in sensors],
+                item["path"],
+            ),
+        )[:max_node_flows]
+        for node_id in nodes_df["node_id"]
+    ]
+
+    edges_df = pd.DataFrame(edge_counter.values())
+    edges_df["total_count"] = edges_df[count_columns].sum(axis=1)
+    edges_df["sensor_counts"] = edges_df.apply(
+        lambda row: {sensor: int(row[sensor_count_column(sensor)]) for sensor in sensors},
+        axis=1,
+    )
+    edges_df["sensor_mix"] = edges_df["sensor_counts"].map(
+        lambda counts: (
+            active[0]
+            if len(active := [sensor for sensor, count in counts.items() if count > 0]) == 1
+            else ("multiple" if active else "none")
+        )
+    )
+    edges_df = edges_df.sort_values(["source_step_index", "total_count"], ascending=[True, False]).reset_index(drop=True)
+    nodes_df = compute_model_order(nodes_df, edges_df)
+
+    top_paths_df = pd.DataFrame(
+        [
+            {"sensor": sensor, "path_prefix": " -> ".join(prefix), "count": count}
+            for sensor, counter in path_prefix_counter.items()
+            for prefix, count in counter.most_common()
+        ]
+    )
+    session_paths_df = pd.DataFrame(session_path_rows)
+    return session_df, nodes_df, edges_df, session_paths_df, top_paths_df
 
 
 def build_session_table(events: pd.DataFrame) -> pd.DataFrame:
@@ -807,11 +1072,10 @@ def run_analyze(args: argparse.Namespace) -> None:
     if events.empty:
         raise SystemExit("No events found for the selected sensors/date range.")
 
-    session_df = build_session_table(events)
+    session_df, state_nodes, state_edges, session_paths, top_paths_df = build_session_artifacts(events, sensors)
     stage_counts = build_stage_counts(session_df)
     fingerprinting_candidates = build_fingerprinting_candidates(session_df, sensors)
     top_tables = build_top_tables(events, session_df)
-    state_nodes, state_edges, session_paths, top_paths_df = build_session_paths(events, sensors)
     graph_json = build_graph_json(state_nodes, state_edges, session_df, sensors, args.from_date, args.to_date)
 
     write_dataframe(session_df, artifact_dir / "cowrie_sessions.parquet")
