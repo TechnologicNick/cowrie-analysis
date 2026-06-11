@@ -58,16 +58,14 @@ This uses separate images:
 
 ```powershell
 cd honeypot/analysis
-docker compose --profile tools run --rm analyze
+docker compose --profile tools run --build --rm analyze
 ```
 
 2. Run render.
-   Rebuild first if you changed any Dockerfile or JS dependency.
 
 ```powershell
 cd honeypot/analysis
-docker compose --profile tools build render
-docker compose --profile tools run --rm render
+docker compose --profile tools run --build --rm render
 ```
 
 3. Start the viewer.
